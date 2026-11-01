@@ -1,0 +1,18 @@
+[package]
+name = "ess-codec-palette"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ess-core = { path = "../ess-core" }
+
+# 浏览器只解码：wasm 上没有 zstd 的 C 依赖，改用纯 Rust 解码器（O-14）
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = "0.13"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ruzstd = "0.7"
+
+[dev-dependencies]
+proptest = "1"
+ess-codec-png = { path = "../ess-codec-png" }

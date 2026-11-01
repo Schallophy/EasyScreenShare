@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>屏幕共享 · 浏览器观看</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas, video { max-width: 100%; max-height: 100%; background: #000; }
+  canvas { image-rendering: pixelated; }
+  video { object-fit: contain; }
+  #hud {
+    position: fixed; left: 12px; top: 12px; padding: 6px 10px;
+    font: 12px/1.5 ui-monospace, Consolas, monospace; color: #9fe;
+    background: rgba(0,0,0,.55); border-radius: 6px; pointer-events: none;
+    white-space: pre;
+  }
+  #sound {
+    position: fixed; right: 12px; top: 12px; padding: 6px 10px;
+    font: 12px/1.4 ui-monospace, Consolas, monospace; color: #9fe;
+    background: rgba(0,0,0,.55); border: 1px solid #2a5; border-radius: 6px;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="screen" width="16" height="9"></canvas>
+  <video id="stream" autoplay playsinline muted hidden></video>
+</div>
+<div id="hud">正在加载…</div>
+<button id="sound" hidden>声音 开</button>
+<script src="livekit-client.umd.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

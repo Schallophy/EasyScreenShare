@@ -1,0 +1,12 @@
+[package]
+name = "ess-web"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ess-core = { path = "../ess-core" }
+ess-codec-palette = { path = "../ess-codec-palette" }
+ess-codec-png = { path = "../ess-codec-png" }

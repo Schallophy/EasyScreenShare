@@ -1,0 +1,14 @@
+[package]
+name = "ess-session"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ess-core = { path = "../ess-core" }
+ess-codec-palette = { path = "../ess-codec-palette" }
+ess-codec-png = { path = "../ess-codec-png" }
+ess-capture = { path = "../ess-capture" }
+ess-transport = { path = "../ess-transport" }
+ess-audio = { path = "../ess-audio" }
+livekit = "0.9"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }

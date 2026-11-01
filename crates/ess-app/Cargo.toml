@@ -1,0 +1,48 @@
+[package]
+name = "ess-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ess-core = { path = "../ess-core" }
+ess-transport = { path = "../ess-transport" }
+ess-session = { path = "../ess-session" }
+ess-capture = { path = "../ess-capture" }
+ess-codec-palette = { path = "../ess-codec-palette" }
+ess-codec-png = { path = "../ess-codec-png" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
+tokio-stream = "0.1"
+minifb = "0.27"
+livekit = "0.9"
+
+# 局域网地址选择要枚举网卡（IfType / _operStatus / 网关），不为此引第三方封装
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[[bin]]
+name = "ess-share"
+path = "src/bin/share.rs"
+
+[[bin]]
+name = "ess-view"
+path = "src/bin/view.rs"
+
+[[bin]]
+name = "ess-serve"
+path = "src/bin/serve.rs"
+
+[[bin]]
+name = "ess-gen-expected"
+path = "src/bin/gen_expected.rs"
+
+[[bin]]
+name = "ess-tone"
+path = "src/bin/tone.rs"
+
+[[bin]]
+name = "ess-scroll-dump"
+path = "src/bin/scroll_dump.rs"

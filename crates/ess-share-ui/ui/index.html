@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>屏幕共享 · 分享端</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>屏幕共享</h1>
+    <span id="pill" class="pill idle">空闲</span>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="grid">
+        <label class="wide">服务器
+          <input id="server" value="ws://127.0.0.1:7880" spellcheck="false">
+        </label>
+        <label>房间
+          <input id="room" value="demo">
+        </label>
+        <label>身份
+          <input id="identity" value="share">
+        </label>
+        <label class="narrow">帧率
+          <input id="fps" type="number" min="1" max="60" value="30">
+        </label>
+        <label class="narrow">画质·流畅度
+          <select id="mode">
+            <option value="balanced">平衡（默认）</option>
+            <option value="smooth">流畅优先（帧率优先，宁可降分辨率）</option>
+            <option value="clear">清晰优先（保分辨率，带宽不足时掉帧率）</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint">帧率与清晰度是有代价的取舍：「流畅优先」大面积运动时直接走视频流，
+        码率按 0.15 bpp 给足，交付不够就把画面缩小来换帧率；「清晰优先」反过来，
+        宁可掉帧也不糊字。平衡档只在无损通路装不下时才换视频流。</p>
+
+      <label class="check"><input id="demo" type="checkbox"> 合成屏（演示 / 测试，不采集真实屏幕）</label>
+      <label class="check"><input id="shareAudio" type="checkbox" checked> 分享系统声音（默认输出设备的混音；观看端与分享端同机时请静音观看端，否则会回声）</label>
+
+      <details>
+        <summary>高级：画质 / 密钥</summary>
+        <div class="grid">
+          <label>视频清晰度上限
+            <select id="videoRes">
+              <option value="0">自动（跟随屏幕）</option>
+              <option value="1280x720">1280 x 720（更省带宽，延迟低约 15 ms）</option>
+              <option value="1920x1080">1920 x 1080</option>
+            </select>
+          </label>
+          <label>视频码率
+            <select id="videoBr">
+              <option value="0">自动（按帧率 x 像素）</option>
+              <option value="2">2 Mbps</option>
+              <option value="4">4 Mbps</option>
+              <option value="6">6 Mbps</option>
+              <option value="10">10 Mbps</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">大面积运动时画面走视频轨；码率不够时编码器按「保帧率降分辨率」处理
+          （实测 2 Mbps 会把 1080p60 降到 720p，帧率不变）。</p>
+        <div class="grid">
+          <label>API Key <input id="key" value="devkey" spellcheck="false"></label>
+          <label>API Secret <input id="secret" value="secret" type="password" spellcheck="false"></label>
+        </div>
+      </details>
+
+      <div class="actions">
+        <button id="start" class="primary">开始共享</button>
+        <button id="stop" disabled>停止</button>
+      </div>
+      <div id="viewerlink" class="linkrow" hidden>
+        观看端（同一局域网，免安装）：<a id="viewerurl" href="#" target="_blank"></a>
+      </div>
+    </section>
+
+    <section class="card stats">
+      <div class="stat"><span>分辨率</span><b id="s-geom">—</b></div>
+      <div class="stat"><span>时长</span><b id="s-elapsed">0 s</b></div>
+      <div class="stat"><span>采样帧</span><b id="s-frames">0</b></div>
+      <div class="stat"><span>实际帧率</span><b id="s-fps">0</b></div>
+      <div class="stat"><span>画面通道</span><b id="s-plane">图块</b></div>
+      <div class="stat"><span>图块</span><b id="s-tiles">0</b></div>
+      <div class="stat"><span>消息</span><b id="s-msgs">0</b></div>
+      <div class="stat"><span>上行</span><b id="s-bytes">0 B</b></div>
+      <div class="stat"><span>链路估计</span><b id="s-up">—</b></div>
+      <div class="stat"><span>编码输出</span><b id="s-enc">—</b></div>
+      <div class="stat"><span>系统声音</span><b id="s-audio">—</b></div>
+    </section>
+
+    <section class="card logbox">
+      <div class="loghead">日志</div>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+<script src="app.js"></script>
+</body>
+</html>

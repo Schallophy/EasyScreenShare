@@ -1,0 +1,12 @@
+# 构建产物与全部验收输出（含 target/edge-viewer 这个浏览器 profile——里面可能有登录态，绝不进库）
+/target
+
+# 临时脚本产物
+*.tmp
+
+# 浏览器观看端的两个运行时文件不入库，由 scripts/build-web.sh 生成/取回：
+#   ess_web.wasm           cargo build -p ess-web --release --target wasm32-unknown-unknown
+#   livekit-client.umd.js  上游 livekit-client@2.23.0 官方构建，脚本内钉 sha256
+# 观看页缺这两个文件就是空白，demo-browser.sh / web-shed.sh / ess-serve 都会明确报错。
+crates/ess-web/web/ess_web.wasm
+crates/ess-web/web/livekit-client.umd.js

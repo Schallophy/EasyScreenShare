@@ -1,0 +1,11 @@
+[package]
+name = "ess-transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ess-core = { path = "../ess-core" }
+livekit = "0.9"
+livekit-token = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+prost = "0.13"

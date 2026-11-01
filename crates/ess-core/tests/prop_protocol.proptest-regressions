@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ed147b85edccd2e638c69d37be5ba1a80fd67beb76322cbe0558d0969ea3af0e # shrinks to ops = [Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Scroll { tiles: [] }, Edit { tile: 0, content: 0 }, Scroll { tiles: [] }, Edit { tile: 0, content: 0 }, Layout { cols: 2, rows: 2 }, Edit { tile: 4, content: 0 }, Layout { cols: 2, rows: 2 }, Layout { cols: 3, rows: 3 }, Edit { tile: 0, content: 0 }, Scroll { tiles: [0] }, Layout { cols: 3, rows: 2 }, Scroll { tiles: [1, 0] }], drop = 0.23483249056030747, reorder = false
+cc 1bf1ed99f38e7dac509080e35390a922fd7041fb4763c139fa90b8f67f260ebe # shrinks to ops = [Edit { tile: 0, content: 0 }, Scroll { tiles: [7] }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Layout { cols: 5, rows: 2 }, Scroll { tiles: [0, 7] }], drop = 0.14613046843320263, dup = 0.0, reorder = false
+cc c840febaa1fc7cfbdd0e61a719edbd027148e262d86964f5756b744b5df27ac7 # shrinks to ops = [Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Scroll { tiles: [0] }, Edit { tile: 0, content: 0 }, Layout { cols: 2, rows: 2 }, Scroll { tiles: [0, 1] }], drop = 0.17084894313291188, dup = 0.0, reorder = false
+cc cacd63908d83866c2c72ae07f1f9c5df2bd575bc737e153c6333a0dec04c9e72 # shrinks to ops = [Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }, Layout { cols: 2, rows: 2 }, Edit { tile: 4, content: 0 }, Edit { tile: 0, content: 0 }, Edit { tile: 4, content: 0 }, Edit { tile: 0, content: 0 }, Scroll { tiles: [] }, Scroll { tiles: [0] }, Layout { cols: 2, rows: 2 }, Edit { tile: 0, content: 0 }, Edit { tile: 0, content: 0 }], drop = 0.15939122569729505, dup = 0.0, reorder = false

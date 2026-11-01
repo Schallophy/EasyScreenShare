@@ -1,0 +1,10 @@
+[package]
+name = "ess-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ess-core = { path = "../ess-core" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+webp = "0.3"
+rayon = "1"

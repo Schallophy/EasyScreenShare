@@ -1,0 +1,194 @@
+syntax = "proto3";
+
+package ess;
+
+// 字段号在整个文件内唯一；新增字段只能追加，不得复用已废弃的号。
+// 本文件由 ess-core/build.rs 通过 prost-build 编译，字段号冲突会在构建时失败。
+//
+// 演进规则（发布后生效）：
+//   1. 删除的字段号必须用 reserved 声明占用，不得复用。
+//   2. 每次发布保留一份基线副本，用等价于 buf breaking 的检查比对，
+//      禁止删除字段号、禁止改变字段类型、禁止把可选字段改为必填。
+
+enum TileCodec {
+  TILE_CODEC_WEBP_LOSSLESS = 0;
+  TILE_CODEC_PALETTE_ZSTD = 1;
+  TILE_CODEC_PNG = 2;
+  TILE_CODEC_RAW = 3;
+}
+
+enum PathKind {
+  PATH_KIND_TILES = 0;
+  PATH_KIND_SCROLL = 1;
+  PATH_KIND_FULL = 2;
+  PATH_KIND_VIDEO = 3;
+  PATH_KIND_REGION_VIDEO = 4;
+}
+
+message Header {
+  uint32 seq = 1;
+  uint64 ts_us = 2;
+  uint32 layout_id = 3;
+}
+
+message Rect {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 w = 3;
+  uint32 h = 4;
+}
+
+message Tile {
+  uint32 id = 1;
+  uint32 x = 2;
+  uint32 y = 3;
+  uint32 w = 4;
+  uint32 h = 5;
+  uint32 epoch = 6;
+  uint32 version = 7;
+  TileCodec codec = 8;
+  bytes payload = 9;
+  bytes meta_mac = 10;
+}
+
+message TilesUpdate {
+  Header hdr = 1;
+  repeated Tile tiles = 2;
+  ScrollInfo scroll = 3;
+  // 网格尺寸（布局变更后首批更新可能先于整帧到达）
+  uint32 cols = 4;
+  uint32 rows = 5;
+  // 精确修复：走可靠通道，并且必须排在 VideoMode{on:false} 之前。
+  // 普通 Update 是 lossy 的（丢了由状态报告兜底），修复批次不能丢，
+  // 因为观看端把「收到 off」当作画布已经正确的信号。
+  bool repair = 6;
+}
+
+message ScrollInfo {
+  Rect rect = 1;
+  sint32 dy = 2;
+  // 全部平移块（v0.7：只推进 epoch，不重发像素）
+  repeated uint32 affected_tiles = 3;
+  // 与 affected_tiles 一一对应的目标 epoch
+  repeated uint32 epochs = 4;
+  // 真正会重发的条带块（组按它们到齐判定原子应用）
+  repeated uint32 dirty_tiles = 5;
+}
+
+message Scroll {
+  Header hdr = 1;
+  ScrollInfo info = 2;
+  // 滚动组 id（宣告幂等 + 组原子应用的键）
+  uint32 scroll_id = 3;
+}
+
+message RegionUpdate {
+  Header hdr = 1;
+  Rect old_rect = 2;
+  Rect new_rect = 3;
+}
+
+message FullFrame {
+  Header hdr = 1;
+  uint32 frame_id = 2;
+  uint32 idx = 3;
+  uint32 total = 4;
+  uint32 w = 5;
+  uint32 h = 6;
+  TileCodec codec = 7;
+  bytes data = 8;
+  repeated uint32 version_vec = 9;
+  bytes meta_mac = 10;
+  // 布局变更后新网格块的起始 epoch。epoch 全局单调、不随布局重置，
+  // 接收端必须由此初始化，否则与发送端错位（浸泡测试抓到的收敛失败）。
+  repeated uint32 epochs = 11;
+  // 与 version_vec 一一对应的每块编码长度（data 为拼接流，由传输层再分片）
+  repeated uint32 tile_lens = 12;
+}
+
+// 运动帧：整帧降采样 JPEG（有损）。大面积运动时替代逐块更新，
+// 保证目标帧率；静态/文字仍走无损图块。
+message MotionFrame {
+  Header hdr = 1;
+  uint32 frame_id = 2;
+  uint32 w = 3;
+  uint32 h = 4;
+  bytes jpeg = 5;
+}
+
+// 平面切换：on=true 表示发送端已切到视频轨（媒体通道），
+// 图块/JPEG 只是给不支持视频轨的观看端用的兜底。
+message VideoMode {
+  Header hdr = 1;
+  bool on = 2;
+}
+
+message ModeSwitch {
+  Header hdr = 1;
+  PathKind path = 2;
+  uint32 reason = 3;
+}
+
+message Heartbeat {
+  Header hdr = 1;
+  uint32 last_seq = 2;
+  uint64 nonce = 3;
+}
+
+message Nack {
+  Header hdr = 1;
+  uint32 from_seq = 2;
+  uint32 to_seq = 3;
+  repeated uint32 tiles = 4;
+  uint32 attempt = 5;
+}
+
+message StateVector {
+  Header hdr = 1;
+  uint32 tile_size = 2;
+  uint32 cols = 3;
+  uint32 rows = 4;
+  repeated uint32 versions = 5;
+  // 与 versions 一一对应。报告比对必须按 (epoch, version) 对进行：
+  // 只比版本会漏掉「布局变更后再未编辑的块」的 epoch 失同步。
+  repeated uint32 epochs = 6;
+}
+
+message CursorUpdate {
+  Header hdr = 1;
+  sint32 x = 2;
+  sint32 y = 3;
+  bool visible = 4;
+  uint32 shape_id = 5;
+  bytes shape = 6;
+}
+
+message Stats {
+  Header hdr = 1;
+  uint32 rtt_ms = 2;
+  uint32 loss_permille = 3;
+  uint32 render_fps = 4;
+  uint32 staleness_ms = 5;
+}
+
+// 顶层信封：一条数据通道消息 = 一个 Envelope。
+message Envelope {
+  oneof body {
+    TilesUpdate update = 1;
+    Scroll scroll = 2;
+    FullFrame full = 3;
+    StateVector state = 4;
+    Nack nack = 5;
+    DataChunk chunk = 6;
+    MotionFrame motion = 7;
+    VideoMode video = 8;
+  }
+}
+
+// 大消息分片（整帧 > 64000 B 上限，O-1）。分片走可靠通道，按 msg_id 重组。
+message DataChunk {
+  uint32 msg_id = 1;
+  uint32 idx = 2;
+  uint32 total = 3;
+  bytes data = 4;
+}
