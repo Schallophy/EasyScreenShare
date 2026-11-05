@@ -3128,6 +3128,8 @@ dxgi 94 / gdi 71 是单轮，落在 ±10 ms 的跑间噪声里，我不拿它当
 
 回归：`a_late_full_frame_does_not_clobber_newer_tiles`。
 
+**浏览器状态报告一直没发出去（同日发现，第三轮修复的前置缺陷）**。做观看端界面改造时，控制台第一条错误是 `TypeError: Cannot convert 1793884518996 to a BigInt`。`ess_viewer_report` 的 `now_ms` 在 Rust 侧是 `u64`、wasm 里是 i64 形参，JS 必须传 `BigInt`；原代码传的是 `Date.now()`（Number），于是 `sendReport` 每 500 ms 抛一次、**一条状态报告都没发出去**。后果是发送端永远收不到观看端的版本向量：第三轮的"报告按块补"、脱落补账、`layout=0` 请求整帧在浏览器端**实际上从未执行**，手机上的残留只能等下一次内容变化或整帧。改成 `BigInt(Date.now())` 后报告恢复；这也解释了为什么第三轮的改动在浏览器上看起来没有效果（原生观看端走 Rust 侧，不受影响）。以后所有 `u64` 导出一律按 BigInt 传，验收脚本会直接读 `window.__ess.state.msgs` 与发送端的报告计数做对照。
+
 
 ---
 

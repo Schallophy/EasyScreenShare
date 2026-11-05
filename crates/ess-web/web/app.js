@@ -12,6 +12,21 @@ const hud = document.getElementById('hud');
 const canvas = document.getElementById('screen');
 const video = document.getElementById('stream');
 const soundBtn = document.getElementById('sound');
+const stage = document.getElementById('stage');
+const content = document.getElementById('content');
+const chromeEl = document.getElementById('chrome');
+const statusEl = document.getElementById('status');
+const zoomEl = document.getElementById('zoomLabel');
+const fitBtn = document.getElementById('fit');
+const fullBtn = document.getElementById('fullscreen');
+const debugBtn = document.getElementById('debug');
+const overlay = document.getElementById('overlay');
+const ovTitle = document.getElementById('ovTitle');
+const ovText = document.getElementById('ovText');
+const ovSpin = document.getElementById('spin');
+const retryBtn = document.getElementById('retry');
+const bannerEl = document.getElementById('banner');
+const toastEl = document.getElementById('toast');
 const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
 
 let ex = null;          // wasm exports
@@ -33,7 +48,10 @@ let vArmedBase = 0;     // on 到达时的累计解码帧数
 let aTrack = null;      // 已订阅的系统声音轨
 let soundEl = null;     // 声音挂在独立的 <audio> 上（video 元素是 muted 的，为的是绕开自动播放限制）
 let soundMuted = true; // 默认静音：观看端与分享端同机时外放会被环回再抓一遍；用户也要求默认不开声音。要听就点"声音 开"
-const state = { msgs: 0, errors: 0, w: 0, h: 0, serial: 0, feed_ms: 0, feed_n: 0, dropped: 0, loss: 0, duty: 0, partsDropped: 0 };
+// 开发期**不在刷新后恢复“开”**：同机测试时自动外放会立刻形成环回回声（分享端把
+// 扬声器输出再抓回去），整台机器都没法用。只保留“本次会话内”的选择，每次加载
+// 都从静音开始。
+const state = { msgs: 0, errors: 0, w: 0, h: 0, serial: 0, feed_ms: 0, feed_n: 0, dropped: 0, loss: 0, duty: 0, partsDropped: 0, reports: 0 };
 
 // 观看端新鲜度闸门（手机上最关键的一条）。RTC 数据通道在浏览器侧没有反压：解码跟不上
 // 到达速率时，消息就堆在事件循环里按序播放——表现正是"时间轴一直漂移、观看端不追最新
@@ -178,14 +196,358 @@ function hudText() {
     (lastError ? `\n${lastError}` : '');
 }
 
+// ── 观看端界面状态（桌面优先） ─────────────────────────────────────────────
+// 桌面：滚轮缩放、左键拖动平移、双击 适应/1:1、F 全屏、0/1 复位、S 声音。
+// 触摸沿用同一套 Pointer Events（单指拖动、双指捏合），不额外维护两套代码。
+
+let viewState = 'connecting';   // connecting | waiting | live | reconnecting | error
+let viewMode = 'fit';           // fit | manual
+let relZoom = 1;                // 相对“适应”的倍率（1 = 适应）
+let panX = 0, panY = 0;         // 相对居中的屏幕像素偏移
+let chromeTimer = 0;
+let toastTimer = 0;
+let soundHinted = false;
+let wakeLock = null;
+const pointers = new Map();
+let drag = null;
+let pinch = null;
+let lastTapAt = 0;
+
+function mediaSize() {
+  if (videoOn && !video.hidden && video.videoWidth > 0) {
+    return [video.videoWidth, video.videoHeight];
+  }
+  return [canvas.width || state.w, canvas.height || state.h];
+}
+
+function fitScale(w, h) {
+  const vw = stage.clientWidth || innerWidth;
+  const vh = stage.clientHeight || innerHeight;
+  if (!w || !h) return 1;
+  return Math.min(vw / w, vh / h);
+}
+
+function clampPan(s, w, h) {
+  const vw = stage.clientWidth || innerWidth;
+  const vh = stage.clientHeight || innerHeight;
+  const mx = Math.max(0, (w * s - vw) / 2);
+  const my = Math.max(0, (h * s - vh) / 2);
+  panX = Math.max(-mx, Math.min(mx, panX));
+  panY = Math.max(-my, Math.min(my, panY));
+}
+
+function layoutView() {
+  const [w, h] = mediaSize();
+  const vw = stage.clientWidth || innerWidth;
+  const vh = stage.clientHeight || innerHeight;
+  if (!w || !h) return;
+  if (viewMode === 'fit') { relZoom = 1; panX = 0; panY = 0; }
+  const s = fitScale(w, h) * relZoom;
+  clampPan(s, w, h);
+  const tx = (vw - w * s) / 2 + panX;
+  const ty = (vh - h * s) / 2 + panY;
+  content.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  zoomEl.textContent = viewMode === 'fit' ? '适应' : `${Math.round(s * 100)}%`;
+  fitBtn.textContent = viewMode === 'fit' ? '1:1' : '适应';
+}
+
+/** 以 (cx, cy) 为锚缩放。factor = 1.25 表示放大 25%。 */
+function zoomAt(factor, cx, cy) {
+  const [w, h] = mediaSize();
+  if (!w || !h) return;
+  const vw = stage.clientWidth || innerWidth;
+  const vh = stage.clientHeight || innerHeight;
+  const fs = fitScale(w, h);
+  const s0 = fs * relZoom;
+  const s1 = Math.max(fs, Math.min(fs * 8, s0 * factor));
+  const tx0 = (vw - w * s0) / 2 + panX;
+  const ty0 = (vh - h * s0) / 2 + panY;
+  const px = (cx - tx0) / s0;
+  const py = (cy - ty0) / s0;
+  const tx1 = cx - px * s1;
+  const ty1 = cy - py * s1;
+  relZoom = s1 / fs;
+  panX = tx1 - (vw - w * s1) / 2;
+  panY = ty1 - (vh - h * s1) / 2;
+  viewMode = relZoom > 1.001 ? 'manual' : 'fit';
+  layoutView();
+}
+
+function goFit() {
+  viewMode = 'fit';
+  layoutView();
+}
+
+/** 1:1：一个屏幕像素对一个画面像素，桌面端读小字最清楚。 */
+function goOneToOne() {
+  const [w, h] = mediaSize();
+  if (!w || !h) return;
+  const fs = fitScale(w, h);
+  viewMode = 'manual';
+  relZoom = 1 / fs;
+  panX = 0;
+  panY = 0;
+  layoutView();
+}
+
+function toggleZoomMode() {
+  if (viewMode === 'fit') goOneToOne();
+  else goFit();
+}
+
+function showChrome() {
+  document.body.classList.remove('idle');
+  clearTimeout(chromeTimer);
+  chromeTimer = setTimeout(() => {
+    if (viewState === 'live' && overlay.hidden) document.body.classList.add('idle');
+  }, 3000);
+}
+
+function banner(text, hideAfterMs) {
+  bannerEl.textContent = text;
+  bannerEl.classList.add('on');
+  clearTimeout(banner._timer);
+  if (hideAfterMs) banner._timer = setTimeout(() => bannerEl.classList.remove('on'), hideAfterMs);
+}
+
+function hideBanner() {
+  clearTimeout(banner._timer);
+  bannerEl.classList.remove('on');
+}
+
+function toast(text, ms = 2800) {
+  toastEl.textContent = text;
+  toastEl.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('on'), ms);
+}
+
+function updateStatus() {
+  document.title = viewState === 'live' ? '▶ 屏幕共享' : '屏幕共享 · 观看';
+  if (viewState === 'error') { statusEl.textContent = '连接失败'; return; }
+  if (viewState === 'connecting') { statusEl.textContent = '正在连接…'; return; }
+  if (viewState === 'waiting') { statusEl.textContent = '已连接，等待画面…'; return; }
+  if (viewState === 'reconnecting') { statusEl.textContent = '连接中断，正在重连…'; return; }
+  const plane = videoOn ? '视频' : '图块';
+  const rate = fps > 0 ? `${fps} fps` : '静止';
+  const [w, h] = mediaSize();
+  statusEl.innerHTML = `<b>${w}×${h}</b> · ${rate} · ${plane}`;
+}
+
+/**
+ * 界面状态机。overlay 只用于“还没画面/彻底失败”，重连期间保留最后一帧，
+ * 用顶部细条提示，避免整屏黑一下。
+ */
+function setViewState(name, detail) {
+  viewState = name;
+  updateStatus();
+  if (name === 'live') {
+    overlay.hidden = true;
+    hideBanner();
+    showChrome();
+    keepAwake();
+    layoutView();
+    return;
+  }
+  const hadFrame = state.w > 0;
+  if (name === 'reconnecting' && hadFrame) {
+    overlay.hidden = true;
+    banner('连接中断，正在重连…');
+  } else {
+    overlay.hidden = false;
+    hideBanner();
+    ovSpin.hidden = !(name === 'connecting' || name === 'waiting');
+    retryBtn.hidden = name !== 'error';
+    if (name === 'connecting') {
+      ovTitle.textContent = '正在连接分享端…';
+      ovText.textContent = '正在获取房间令牌';
+    } else if (name === 'waiting') {
+      ovTitle.textContent = '已连接，等待画面…';
+      ovText.textContent = '分享端可能还没开始共享，或正在准备第一帧';
+    } else if (name === 'reconnecting') {
+      ovTitle.textContent = '连接中断，正在重连…';
+      ovText.textContent = detail || '网络恢复后会自动继续';
+    } else {
+      ovTitle.textContent = '连接失败';
+      ovText.textContent = detail || '无法连接到分享端';
+    }
+  }
+  clearTimeout(chromeTimer);
+  document.body.classList.remove('idle');
+}
+
+function markLive() {
+  if (viewState === 'live' || state.w === 0) return;
+  setViewState('live');
+  updateStatus();
+}
+
+async function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+  } catch (e) {
+    toast('这个浏览器不允许网页全屏，可以按 F11');
+  }
+}
+
+async function keepAwake() {
+  if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) { /* 不支持就算了，桌面端不依赖它 */ }
+}
+
+function toggleSound() {
+  if (!soundBtn || soundBtn.hidden) return;
+  soundMuted = !soundMuted;
+  if (soundEl) {
+    soundEl.muted = soundMuted;
+    if (soundMuted) soundEl.pause();
+    else {
+      const p = soundEl.play();
+      if (p && p.catch) p.catch(() => {});
+    }
+  }
+  paintSoundBtn();
+  showChrome();
+  // 声音是默认关闭的，切换后给一句明确反馈（尤其“开启”那一下，用户需要知道确实生效）。
+  toast(soundMuted ? '系统声音已静音' : '系统声音已开启', 1400);
+}
+
+// 键盘：桌面端的主路径。
+window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key;
+  if (k === 'f' || k === 'F') { e.preventDefault(); toggleFullscreen(); }
+  else if (k === '0') { e.preventDefault(); goFit(); }
+  else if (k === '1') { e.preventDefault(); goOneToOne(); }
+  else if (k === '+' || k === '=') { e.preventDefault(); zoomAt(1.25, innerWidth / 2, innerHeight / 2); }
+  else if (k === '-' || k === '_') { e.preventDefault(); zoomAt(0.8, innerWidth / 2, innerHeight / 2); }
+  else if (k === 's' || k === 'S') { e.preventDefault(); toggleSound(); }
+  else if (k === 'd' || k === 'D') { e.preventDefault(); document.body.classList.toggle('debug'); }
+  else if (k === 'r' || k === 'R') { e.preventDefault(); location.reload(); }
+});
+
+// 滚轮缩放（桌面主路径）：锚在鼠标位置，滚轮不再滚动页面。
+stage.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+  showChrome();
+}, { passive: false });
+
+stage.addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  try { stage.setPointerCapture(e.pointerId); } catch (err) { /* 合成事件/已释放 */ }
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 1) {
+    drag = { x: e.clientX, y: e.clientY, panX, panY, moved: false };
+    pinch = null;
+  } else if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    drag = null;
+    pinch = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1 };
+    showChrome();
+  }
+});
+
+stage.addEventListener('pointermove', (e) => {
+  if (!pointers.has(e.pointerId)) {
+    // 鼠标只是移动（没按键）：唤出 chrome
+    if (e.pointerType === 'mouse') showChrome();
+    return;
+  }
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size >= 2 && pinch) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2;
+    zoomAt(d / pinch.d, mx, my);
+    pinch.d = d;
+    showChrome();
+    return;
+  }
+  if (drag && pointers.size === 1) {
+    const dx = e.clientX - drag.x;
+    const dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+    if (relZoom > 1.001) {
+      panX = drag.panX + dx;
+      panY = drag.panY + dy;
+      layoutView();
+      showChrome();
+    }
+  }
+});
+
+function endPointer(e) {
+  const wasSingle = pointers.size === 1;
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 0) {
+    const tapped = !!drag && !drag.moved;
+    drag = null;
+    if (wasSingle && tapped) {
+      const now = performance.now();
+      if (now - lastTapAt < 300) {
+        toggleZoomMode();
+        lastTapAt = 0;
+      } else {
+        lastTapAt = now;
+        // 单击只负责“唤出”，不主动隐藏：隐藏交给 3 s 自动计时。
+        // 这样双击（唤出 + 切换到 1:1）不会先把 chrome 藏起来。
+        if (viewState === 'live') showChrome();
+      }
+    }
+  }
+}
+stage.addEventListener('pointerup', endPointer);
+stage.addEventListener('pointercancel', endPointer);
+
+window.addEventListener('resize', () => layoutView());
+window.addEventListener('orientationchange', () => setTimeout(layoutView, 120));
+// 编码器可能在中途改分辨率（视频平面 960x540 ↔ 1920x1080），<video> 的固有尺寸
+// 变化不会触发 window resize，得自己跟。
+video.addEventListener('loadedmetadata', () => { if (!video.hidden) layoutView(); });
+video.addEventListener('resize', () => { if (!video.hidden) layoutView(); });
+// 鼠标停在顶栏上时不要把它淡出（正在找按钮的时候消失最恼人）。
+chromeEl.addEventListener('pointerenter', () => clearTimeout(chromeTimer));
+chromeEl.addEventListener('pointerleave', () => { if (viewState === 'live') showChrome(); });
+document.addEventListener('fullscreenchange', () => {
+  fullBtn.textContent = document.fullscreenElement ? '退出全屏' : '全屏';
+  setTimeout(layoutView, 60);
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && viewState === 'live') keepAwake();
+});
+
+fitBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleZoomMode(); showChrome(); });
+fullBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleFullscreen(); showChrome(); });
+debugBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.body.classList.toggle('debug');
+  showChrome();
+});
+retryBtn.addEventListener('click', () => location.reload());
+soundBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleSound(); });
+
+updateStatus();
+
 function paintSoundBtn() {
   if (!soundBtn) return;
   soundBtn.hidden = !aTrack;
-  soundBtn.textContent = soundMuted ? '声音 开' : '声音 关';
+  // 文案描述**当前状态**，而不是“点一下会怎样”：旧文案「声音 开」既可以读成
+  // “声音已经开着”，也可以读成“点一下打开”，语义不清。现在用「声音：关/开」
+  // 加图标，title 里再写清点击动作。
+  soundBtn.textContent = soundMuted ? '🔇 声音：关' : '🔊 声音：开';
+  soundBtn.title = soundMuted ? '系统声音当前关闭，点击开启' : '系统声音当前开启，点击静音';
+  soundBtn.setAttribute('aria-pressed', soundMuted ? 'false' : 'true');
+  soundBtn.setAttribute('aria-label', soundMuted ? '系统声音：关，点击开启' : '系统声音：开，点击静音');
 }
 
 async function loadWasm() {
-  const url = 'ess_web.wasm';
+  const url = 'ess_web.wasm?v=20261105c';
   let inst;
   try {
     inst = await WebAssembly.instantiateStreaming(fetch(url), {});
@@ -295,6 +657,8 @@ function draw() {
   ctx.putImageData(img, 0, 0, x, y, bw, bh);
   drawnSerial = serial;
   frames++;
+  // 第一帧真正上屏 = 可以从“等待画面”切到 live（布局也在这时才有正确尺寸）
+  markLive();
 }
 
 function videoModeNow() {
@@ -307,6 +671,8 @@ function applyPlane() {
   const showVideo = videoOn && vTrack !== null && videoArmed;
   video.hidden = !showVideo;
   canvas.hidden = showVideo;
+  // 两种平面的固有尺寸可能不同：切换后重新按“适应”算一次
+  layoutView();
 }
 
 function armVideo() {
@@ -345,6 +711,7 @@ function syncPlane() {
     }
     applyPlane();
     hud.textContent = hudText();
+    updateStatus();
     return;
   }
   // requestVideoFrameCallback 不可用时的兜底：解码帧计数前进了就接管
@@ -367,6 +734,11 @@ function tick() {
     state.loss = dv[17];
     if (dn > 18) state.partsDropped = dv[18];
   }
+  // 尺寸/代数在 rAF 被暂停的标签页里也要正确（draw 不会跑）
+  state.w = ex.ess_viewer_width(viewer) >>> 0;
+  state.h = ex.ess_viewer_height(viewer) >>> 0;
+  state.serial = ex.ess_viewer_serial(viewer) >>> 0;
+  if (viewState === 'waiting' && state.w > 0) markLive();
   if (now - lastFpsAt < 1000) return;
   const total = videoFramesTotal();
   // 视频平面时图块计数不动，帧率要从播放器的累计解码帧里取
@@ -374,14 +746,11 @@ function tick() {
   frames = 0;
   vPrev = total;
   lastFpsAt = now;
-  // 分辨率/代数在 rAF 被暂停的标签页里也要显示正确（draw 不会跑）
-  state.w = ex.ess_viewer_width(viewer) >>> 0;
-  state.h = ex.ess_viewer_height(viewer) >>> 0;
-  state.serial = ex.ess_viewer_serial(viewer) >>> 0;
   // 序列空洞（diag 末槽）：没按序到达的发送端消息数。口径要说清——本地 shed 闸门挡下的
   // 消息同样不会进 wasm，所以这个数含「链路丢」与「本机解码闸门丢」两部分；闸门关掉
   // （平时 duty 不高）时它就等于链路丢的量。与 丢=（只数本机闸门）分开看。
   hud.textContent = hudText();
+  updateStatus();
 }
 
 function loop() {
@@ -410,7 +779,9 @@ async function main() {
   await loadWasm();
   loop();
 
-  const cfg = await (await fetch('token')).json();
+  const cfgRes = await fetch('token');
+  if (!cfgRes.ok) throw new Error(`获取房间令牌失败（HTTP ${cfgRes.status}）`);
+  const cfg = await cfgRes.json();
   const room = new Room({ adaptiveStream: false, dynacast: false });
   room.on(RoomEvent.DataReceived, (payload, kind) => {
     const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
@@ -424,14 +795,16 @@ async function main() {
   });
   room.on(RoomEvent.Disconnected, () => {
     connected = false;
-    lastError = '连接已断开（刷新页面重连）';
+    lastError = '连接已断开（分享端可能已停止）';
     hud.textContent = hudText();
+    setViewState('error', lastError);
   });
   // SDK 会自己重连。重连成功必须把 connected 恢复：它一为 false，上行报告就永久
   // 停止，发送端再也补不回断线期间丢掉的块，画面会停在断线前的旧帧上。
   room.on(RoomEvent.Reconnecting, () => {
     lastError = '连接中断，正在重连…';
     hud.textContent = hudText();
+    setViewState('reconnecting');
   });
   room.on(RoomEvent.Reconnected, () => {
     connected = true;
@@ -439,6 +812,8 @@ async function main() {
     // 恢复上行报告：断线期间丢的块靠它要回来。若这次重连让发送端看到了
     // 参与者重加入，它会主动补整帧，画布不需要在这里重建。
     hud.textContent = hudText();
+    setViewState(state.w > 0 ? 'live' : 'waiting');
+    if (state.w > 0) banner('已恢复连接', 1500);
   });
   // 视频平面：轨道一到就挂上，并告诉 WASM 可以不再解码 JPEG 兜底帧
   room.on(RoomEvent.TrackSubscribed, (track) => {
@@ -456,13 +831,26 @@ async function main() {
       try {
         if (typeof track.attach === 'function') track.attach(soundEl);
         else soundEl.srcObject = new MediaStream([track.mediaStreamTrack]);
-        const p = soundEl.play();
-        if (p && p.catch) p.catch(() => {});
+        // **必须在 attach 之后重新静音**：LiveKit 的 attach 会执行
+        // `element.muted = (音频轨数量 === 0)`，对音频轨就是 muted=false，把我们
+        // 刚设的静音覆盖掉。观看端与分享端同机时这一步会立刻形成环回回声。
+        soundEl.muted = soundMuted;
+        // 静音时干脆不播放：即使将来某个路径把 muted 改回去，也不会突然出声。
+        if (soundMuted) soundEl.pause();
+        else {
+          const p = soundEl.play();
+          if (p && p.catch) p.catch(() => {});
+        }
       } catch (e) {
         lastError = '声音轨挂载失败: ' + e.message;
       }
       paintSoundBtn();
       hud.textContent = hudText();
+      // 默认静音是产品决定（同机外放会环回成回声），但用户得知道"有声音可开"。
+      if (soundMuted && !soundHinted) {
+        soundHinted = true;
+        toast('有系统声音，点顶部「声音」开启');
+      }
       return;
     }
     if (track.kind !== 'video') return;
@@ -509,6 +897,8 @@ async function main() {
   await room.connect(cfg.url, cfg.token);
   connected = true;
   hud.textContent = hudText();
+  // 连上了但还没收到首帧：说清楚在等什么，不要留一块黑屏
+  if (state.w === 0) setViewState('waiting');
 
   // 浏览器自动播放策略：声音要等一次用户手势才允许出声。不加遮罩（对着只想看画面的人
   // 是打扰），改成任何点击/按键都顺手放行一次。
@@ -523,14 +913,6 @@ async function main() {
   };
   window.addEventListener('pointerdown', resumeSound);
   window.addEventListener('keydown', resumeSound);
-  if (soundBtn) {
-    soundBtn.addEventListener('click', () => {
-      soundMuted = !soundMuted;
-      if (soundEl) soundEl.muted = soundMuted;
-      paintSoundBtn();
-      hud.textContent = hudText();
-    });
-  }
 
   // 上行状态报告：驱动发送端对丢失块的差异重发（§6.4 兜底）
   setInterval(() => {
@@ -540,9 +922,13 @@ async function main() {
   let gapsReported = 0;
   function sendReport() {
     if (!connected) return;
-    const n = ex.ess_viewer_report(viewer, reportPtr, reportCap, Date.now());
+    // `now_ms` 在 Rust 侧是 u64 → wasm 的 i64 形参，JS 必须传 BigInt。
+    // 这里一直传 Number，浏览器每次都在 `sendReport` 抛 TypeError——报告实际
+    // 一条都没发出去（发送端因此永远收不到观看端的版本向量与补块请求）。
+    const n = ex.ess_viewer_report(viewer, reportPtr, reportCap, BigInt(Date.now()));
     if (n > 0) {
       gapsReported = state.loss;
+      state.reports++;
       const bytes = new Uint8Array(mem.buffer, reportPtr, n).slice();
       room.localParticipant.publishData(bytes, { reliable: true }).catch((e) => {
         lastError = '报告发送失败: ' + e.message;
@@ -578,6 +964,17 @@ async function main() {
     state,
     // 延迟归因用（#60）：探针需要 room→engine→client 的真实字段名才能拿到 pc
     room,
+    /** 界面读数（验收用）：状态机、缩放、chrome 是否自动隐藏。 */
+    ui: () => ({
+      state: viewState,
+      zoom: relZoom,
+      mode: viewMode,
+      pan: [panX, panY],
+      chromeIdle: document.body.classList.contains('idle'),
+      fullscreen: !!document.fullscreenElement,
+    }),
+    /** 验收用：直接切界面状态，验证 overlay/toast 的文案与按钮。 */
+    setUiState: (s, d) => setViewState(s, d),
     sample(x, y) {
       if (!curW || !curH) return null;
       const d = ctx.getImageData(x, y, 1, 1).data;
@@ -624,5 +1021,6 @@ async function main() {
 main().catch((e) => {
   lastError = '启动失败: ' + (e && e.message ? e.message : e);
   hud.textContent = hudText();
+  setViewState('error', lastError);
   console.error(e);
 });
