@@ -1243,6 +1243,10 @@ pub async fn run(
                     if let Ok(v) = std::env::var("ESS_MOTION_HOLD") {
                         if let Ok(n) = v.parse() { p.hold_frames = n; }
                     }
+                    // 算力路径切平面的最低变化占比（0 = 关掉门槛，回到只看能不能编动）
+                    if let Ok(v) = std::env::var("ESS_ENCODE_PLANE_MIN_RATIO") {
+                        if let Ok(n) = v.parse() { p.encode_plane_min_ratio = n; }
+                    }
                     // 图块选码：0 = 强制无损（验收臂的单变量对照，旧"逐字节相等"契约靠它复跑），
                     // 默认按"省几倍"降级到 JPEG（见 `CodecSet::encode_by_cost`）。
                     if let Ok(v) = std::env::var("ESS_LOSSY_SAVE_X") {
@@ -1350,9 +1354,16 @@ pub async fn run(
                     // 进入沿：记下时刻，让帧率控制器在前 2 s 的爬坡期内不动手（见观测支路）。
                     if p.video_mode() && !vmode_prev {
                         plane_on_at = Some(Instant::now());
+                        // 平面期内不测图块耗时，进平面前那一刻的判定不能一直当真：
+                        // 留着它会让平面退出的迟滞每帧续期，进来就再也退不出去。
+                        enc_pressure = false;
+                        enc_over_ticks = 0;
+                        enc_under_ticks = 0;
+                        emit(Event::Log("视频平面进入 → 画面由媒体通道出".into()));
                     }
                     if !p.video_mode() && vmode_prev {
                         plane_on_at = None;
+                        emit(Event::Log("视频平面退出 → 回到无损图块".into()));
                         // 那一段没被带宽压着，说明当前尺寸真发得动：记下来给下次进入用，
                         // 便宜内容不该每次切换都白缩一遍
                         if link_now.ql_bw < 0.02 {
@@ -1385,6 +1396,20 @@ pub async fn run(
                     // 被两根同时刻的输入帧绊了一下）。
                     if p.video_mode() && !was_video && !was_feeding {
                         vp.push(&frame);
+                    }
+                    // 帧率上限是图块通路和媒体通路共用的一个数。图块阶段按 1080p 的
+                    // 差分/编码耗时把它压到过 4，平面一开这个数不会自己回来——采集线程
+                    // 仍按 4 fps 出帧，视频通路就永远只有 4 帧。预热起点和交接沿都把它
+                    // 还给声明帧率：此后只有编码器真的算力不够（且像素已到底）才会再动它。
+                    if (!was_feeding && p.media_feeding())
+                        || (p.video_mode() && !was_video)
+                    {
+                        let prev = fps_ctl.swap(fps_ceil, Ordering::Relaxed);
+                        if prev < fps_ceil {
+                            emit(Event::Log(format!(
+                                "进入媒体通路（预热/交接）→ 帧率上限 {prev} → {fps_ceil} fps（图块阶段的降档不带入媒体通路）"
+                            )));
+                        }
                     }
                     vmode_prev = p.video_mode();
                 }
@@ -1502,8 +1527,14 @@ pub async fn run(
                 // 在这段也要动手（见下面 `vmode || pending`）——改尺寸的代价（重配 +
                 // 关键帧，实测 260–490 ms 的画面空洞）此刻落在观众看不见的画面上。
                 let pending = pipeline.as_ref().map(|p| p.media_pending()).unwrap_or(false);
-                gov.set_class(if vmode { ContentClass::Video } else { ContentClass::Text });
-                gov.motion = vmode;
+                // 预热期也算视频类：这时喂给编码器的已经是满帧率，拿图块的耗时去判
+                // "算力不够"会把声明帧率当成本钱砍掉（1080p 图块差分本来就贵）。
+                gov.set_class(if vmode || pending {
+                    ContentClass::Video
+                } else {
+                    ContentClass::Text
+                });
+                gov.motion = vmode || pending;
                 let fps_now = fps_ctl.load(Ordering::Relaxed).max(1) as f32;
                 // §9.2 的「bwe < 需求」判据要求估计值真的反映链路容量。实测本机
                 // availableOutgoingBitrate 只是跟着视频目标码率爬（数据通道不走 pacer），
@@ -1705,8 +1736,13 @@ pub async fn run(
                     }
                 }
                 let obs = Obs {
-                    // 视频平面出画时看编码器的每帧耗时；图块平面看我们自己管线的耗时
-                    encode_ms: if vmode { link_now.enc_ms_frame as f32 } else { tile_ms },
+                    // 视频平面出画时看编码器的每帧耗时；图块平面看我们自己管线的耗时。
+                    // 预热期同理——那一段图块还在画，但帧率预算已经归编码器了。
+                    encode_ms: if vmode || pending {
+                        link_now.enc_ms_frame as f32
+                    } else {
+                        tile_ms
+                    },
                     budget_ms: 1000.0 / fps_now,
                     queue_delay_ms: link_now.queue_ms,
                     qp: link_now.avg_qp,
@@ -1788,6 +1824,22 @@ pub async fn run(
                         // 帧率是对用户的承诺，带宽/排队受限不动它；真正被收放的是上面
                         // set_budget_bps 那次调用里的图块通路预算。日志要说"做了什么"，
                         // 不能说"应压制"——那副模样好像执行器还没接上。
+                        //
+                        // 但升档不能只是"不动"：图块阶段或编码器算力受限期把上限压下来
+                        // 之后，链路回升的每一步都要把上限往上还（只升不降），否则那个
+                        // 低帧率会一直留到下一次交接。
+                        if step == Step::Up && (vmode || pending) {
+                            let want = ((fps_ceil as u64 * gov.settings().fps as u64)
+                                / gov.top_fps() as u64)
+                                .clamp(1, fps_ceil as u64) as u32;
+                            let cur = fps_ctl.load(Ordering::Relaxed);
+                            if want > cur {
+                                fps_ctl.store(want, Ordering::Relaxed);
+                                emit(Event::Log(format!(
+                                    "视频平面帧率上限回升 {cur} → {want} fps"
+                                )));
+                            }
+                        }
                         emit(Event::Log(format!(
                             "守门员：{}（{why}）→ 图块预算 {}，帧率保持 {} fps",
                             if step == Step::Down { "链路收紧" } else { "链路回升" },

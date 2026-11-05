@@ -210,6 +210,12 @@ pub struct SendPipeline<'c> {
     last_encoded: u64,
     /// 当前平面是被**预算**逼进来的（不是大面积运动），退出条件不同
     budget_plane: bool,
+    /// 本次平面是被"无损编码耗时超预算"单独逼进来的。平面期内图块通路不编码，
+    /// 实测不到的新耗时不能当续期理由，退出改看当前的差异占比。
+    encode_plane: bool,
+    /// 算力路径进入平面的最低变化占比（变化块 / 总块）。低于它先降帧率/尺寸，
+    /// 不切有损平面——小改动不值得付出 H264 的清晰度代价。
+    pub encode_plane_min_ratio: f32,
     /// 预热中：决策已经把画面判给媒体平面，但**还没对它做宣告**，无损图块仍是画面
     /// 来源。见 [`Self::plane_handover`]。
     media_pending: bool,
@@ -301,6 +307,8 @@ impl<'c> SendPipeline<'c> {
             win_tiles: 0,
             last_encoded: 0,
             budget_plane: false,
+            encode_plane: false,
+            encode_plane_min_ratio: 0.10,
             encode_pressure: false,
             media_pending: false,
             warm_started_us: 0,
@@ -342,8 +350,11 @@ impl<'c> SendPipeline<'c> {
 
     /// 无损平面**编码速度**装不下帧预算时置 true（调用方按实测单帧耗时判定，带迟滞）。
     /// 置上之后与"链路装不下"走同一条路：把画面交给媒体通道，而不是把延迟堆成旧片子。
+    ///
+    /// 平面期内图块通路不编码，调用方手里的还是进入前那次的判定；继续认它会让
+    /// 退出的迟滞每帧续期，平面再也回不到无损。所以平面一开就当作废，退出后重新测。
     pub fn set_encode_pressure(&mut self, on: bool) {
-        self.encode_pressure = on;
+        self.encode_pressure = on && !self.video_mode;
     }
 
     /// 传输层真的把无损更新丢掉了（发送队列溢出 `qdrop`、新鲜度闸门 `stale`、限速桶 `shed`）。
@@ -750,7 +761,16 @@ impl<'c> SendPipeline<'c> {
                 // 抖动的来源就是"举起它的信号不参与维持它"。
                 // strain 自限：画面静止 → 无更新 → 两个 500 ms 报告内衰减 → 照样退回无损，
                 // 由 `settled_picture_returns_to_lossless_even_while_budget_stays_tight` 判真伪。
-                if !self.budget_room(demand_now) || self.encode_pressure || self.receiver_strain {
+                //
+                // 算力平面：平面期内测不到无损编码耗时，续期只能用当前的差异占比代理——
+                // 还在大改就继续由媒体通道出画，回到小改动/静止就退回无损、交给帧率控制器。
+                let tiles = self.grid.tile_count().max(1) as f32;
+                let fresh_ratio = fresh as f32 / tiles;
+                if !self.budget_room(demand_now)
+                    || self.encode_pressure
+                    || self.receiver_strain
+                    || (self.encode_plane && fresh_ratio >= self.encode_plane_min_ratio)
+                {
                     self.motion_hold = self.hold_frames;
                 }
             }
@@ -783,6 +803,7 @@ impl<'c> SendPipeline<'c> {
             self.motion_active = false;
             self.motion_seq = 0;
             self.budget_plane = false;
+            self.encode_plane = false;
             self.plane_prev = None;
             if self.media_pending {
                 // 还没交出去内容就静止了：线上从未宣告过任何事，画布一直是精确无损的，
@@ -878,14 +899,18 @@ impl<'c> SendPipeline<'c> {
         // 不由谁先说话决定。
         let loss_forces = self.loss_needs_plane;
         self.loss_needs_plane = false;
+        // 算力路径也要看这一帧到底变了多少：只动一两块（光标、一行字）就切到有损平面，
+        // 付出的清晰度代价远大于省下的编码时间——这种量级交给帧率/尺寸控制器消化。
+        let changed_ratio = diff.changed.len() as f32 / self.grid.tile_count().max(1) as f32;
         let by_budget = !room || loss_forces;
-        let by_encode = room && self.encode_pressure;
+        let by_encode = room && self.encode_pressure && changed_ratio >= self.encode_plane_min_ratio;
         let by_strain = room && !self.encode_pressure && self.receiver_strain;
         if self.video_plane
             && (!diff.changed.is_empty() || loss_forces)
             && (by_budget || by_encode || by_strain)
         {
             self.budget_plane = true;
+            self.encode_plane = by_encode;
             // 预算/编码逼出来的交接不等预热：无损通路自己都塞不下了，没什么可等的。
             // strain 逼出来的也不等——等它爬坡的那几秒正是它啃不动的画面。
             self.media_pending = false;
