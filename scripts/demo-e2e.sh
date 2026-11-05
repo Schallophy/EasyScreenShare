@@ -19,7 +19,8 @@ sleep 3
 "$BIN/ess-view" --no-window --seconds 14 --dump "$OUT/received.ppm" >"$OUT/view.log" 2>&1 &
 VIEW=$!
 sleep 1
-"$BIN/ess-share" --demo --fps 10 --seconds 16 >"$OUT/share.log" 2>&1 &
+# 断言是"画布逐字节等于期望帧" ⇒ 显式钉无损档（默认档对照片类块走有损，见 docs/IMPLEMENTATION.md）
+ESS_LOSSY_SAVE_X=0 "$BIN/ess-share" --demo --fps 10 --seconds 16 >"$OUT/share.log" 2>&1 &
 SHARE=$!
 
 wait $VIEW

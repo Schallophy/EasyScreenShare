@@ -12,6 +12,7 @@ use ess_codec_palette::PaletteZstdCodec;
 use ess_codec_png::PngCodec;
 use ess_core::frame::Frame;
 use ess_core::governor::{ContentClass, Governor, Obs, Step};
+use ess_core::model::TileId;
 use ess_core::pipeline::{CodecSet, SendPipeline};
 use ess_core::wire::WireMsg;
 
@@ -483,6 +484,12 @@ fn synthetic(w: u32, h: u32) -> ess_capture::SyntheticScreen {
         // ESS_DEMO_VIDEO=1 → "视频窗口 + 弹幕"：大面积、非平移、每帧都变。滚动型内容
         // 对无损通路近乎免费（一条 Scroll 宣告），拿它做性能验收会系统性乐观。
         video_like: std::env::var("ESS_DEMO_VIDEO").map(|v| v != "0").unwrap_or(false),
+        // ESS_DEMO_STEP=N → 第 N 帧把左半屏一次性改掉（配 ESS_DEMO_ANIM=0 用）。
+        // 测「一次大面积变化到底丢多少」，别让渐进动画把丢包伪装成慢。
+        step_at: std::env::var("ESS_DEMO_STEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
     }
 }
 
@@ -517,16 +524,64 @@ fn wire_bytes(m: &WireMsg) -> usize {
 
 /// 入队发送。基线类必须排队（等队列腾地方）；逐块更新满了就地丢，丢的是
 /// "来不及发的旧画面"。真正的年龄闸门在发送任务里（见 `fresh`）。
+/// 一个批次里涉及哪些块（只有无损更新带块 id）。脱落时把这份 id 交给管线，补账才有资格
+/// 按块补而不是按整帧兑现。
+fn batch_tile_ids(msgs: &[WireMsg]) -> Vec<TileId> {
+    let mut out = Vec::new();
+    for m in msgs {
+        if let WireMsg::Update { tiles, .. } = m {
+            out.extend(tiles.iter().map(|t| t.id));
+        }
+    }
+    out
+}
+
+/// 脱落账本：掉的是哪些块（`ids`），以及**有没有掉过我们叫不出块 id 的内容**（`unknown`，
+/// 例如 JPEG 运动帧）。`unknown` 一旦为真，补账必须回到整帧兑现——实测把这条判据放宽成
+/// "只要有些 id 就按块补"，`motion-stays-lossless` 的"画布逐字节等于期望终帧"当场挂。
+#[derive(Default)]
+struct LossAccount {
+    ids: Vec<TileId>,
+    unknown: bool,
+}
+
+/// 把一次脱落并进账本。有块 id 的（Update 批次）按块记；没有 id 可记的内容直接把账标成
+/// 不明，让整帧兜底那条路保留。
+fn merge_lost(v: &mut LossAccount, ids: Vec<TileId>) {
+    if ids.is_empty() {
+        v.unknown = true;
+        return;
+    }
+    let fresh: Vec<TileId> = ids.into_iter().filter(|id| !v.ids.contains(id)).collect();
+    v.ids.extend(fresh);
+}
+
 async fn enqueue(
     tx: &tokio::sync::mpsc::Sender<Batch>,
     dropped: &std::sync::atomic::AtomicU64,
+    lost_ids: &std::sync::Mutex<LossAccount>,
     msgs: Vec<WireMsg>,
 ) {
+    // 空批次直接丢掉，不入队。静止画面每帧都产出一个空批次，它们在队列里 aging 时会被
+    // 新鲜度闸门记成「脱落」，而脱落累计会去设 `loss_claimed` —— 于是观看端一份「我全对上
+    // 了」的报告就被解读成「提交即记账把缺口掩盖了」，每 1.5 s 补一个整帧重建。实测
+    // 1080p 半屏单帧突变 + 之后完全静止：`stale` 0→68、`full` 1→4、`tile_bytes`
+    // 2.45→11.57 MB，其中 9 MB 是这么白花掉的。这里也让 `q`/`lag` 回到「只在真有东西
+    // 要发时才读数」的本义。
+    if msgs.is_empty() {
+        return;
+    }
     let baseline = msgs.iter().any(is_baseline);
+    let ids = batch_tile_ids(&msgs);
     let b = Batch { at: Instant::now(), baseline, msgs };
     let ok = if baseline { tx.send(b).await.is_ok() } else { tx.try_send(b).is_ok() };
     if !ok {
         dropped.fetch_add(1, Ordering::Relaxed);
+        if !ids.is_empty() {
+            if let Ok(mut v) = lost_ids.lock() {
+                merge_lost(&mut v, ids);
+            }
+        }
     }
 }
 /// 创建采集源。返回 (源, 通路说明)，说明直接进日志，免得线上出问题时无从下手。
@@ -703,7 +758,9 @@ pub async fn run(
 
     let pal = PaletteZstdCodec::default();
     let png = PngCodec;
-    let codecs = CodecSet { codecs: &[&pal, &png] };
+    // 发送端选码：照片类块省够 3 倍才降级到 JPEG（实测 4.6×），文字块留无损。
+    let jpeg = ess_core::codec::JpegCodec::default();
+    let codecs = CodecSet { codecs: &[&pal, &png, &jpeg] };
 
     emit(Event::Log(format!(
         "采集源 {w}x{h}（{path}），{} fps",
@@ -932,23 +989,37 @@ pub async fn run(
     let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (gone_tx, mut gone_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let trace = std::env::var("ESS_TRACE").is_ok();
-    tokio::spawn(async move {
-        let mut asm = ess_transport::Assembler::default();
-        let t0 = Instant::now();
-        while let Some(ev) = events.recv().await {
-            match ev {
-                livekit::prelude::RoomEvent::DataReceived { payload, .. } => {
-                    if let Some(WireMsg::State { layout_id, versions, epochs, .. }) =
-                        ess_transport::decode_incoming(&payload, &mut asm)
-                    {
-                        if trace {
-                            eprintln!("report layout={layout_id} tiles={}", versions.len());
+    // 观看端报告的抵达计数（每秒一行进 STATS）。`missing` 只在报告抵达时才刷新，所以
+    // 「观看端一块都不缺」和「观看端不再说话」在读数上长得一模一样——分不开就会把断流
+    // 误判成健康（实测 1080p 半屏单帧突变后，观看端画布代数冻结而 `miss` 恒 0）。
+    let report_cnt = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let rc = report_cnt.clone();
+        tokio::spawn(async move {
+            let mut asm = ess_transport::Assembler::default();
+            let t0 = Instant::now();
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    livekit::prelude::RoomEvent::DataReceived { payload, .. } => {
+                        if let Some(WireMsg::State {
+                            layout_id,
+                            versions,
+                            epochs,
+                            ..
+                        }) = ess_transport::decode_incoming(&payload, &mut asm)
+                        {
+                            rc.fetch_add(1, Ordering::Relaxed);
+                            if trace {
+                                eprintln!("report layout={layout_id} tiles={}", versions.len());
+                            }
+                            let _ = report_tx.send((
+                                layout_id,
+                                versions,
+                                epochs,
+                                t0.elapsed().as_millis() as u64,
+                            )).await;
                         }
-                        let _ = report_tx
-                            .send((layout_id, versions, epochs, t0.elapsed().as_millis() as u64))
-                            .await;
                     }
-                }
                 livekit::prelude::RoomEvent::ParticipantConnected(_) => {
                     let _ = force_tx.try_send(Recovery::Full);
                 }
@@ -972,6 +1043,7 @@ pub async fn run(
             }
         }
     });
+    }
 
     let mut pipeline: Option<SendPipeline> = None;
     // 发送解耦：数据通道写满（实测 ~3.7 MB/s）不能反过来卡住采集节拍——
@@ -986,6 +1058,10 @@ pub async fn run(
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis((4000 / fps_ceil.max(1) as u64).clamp(100, 250)));
     let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel::<Batch>(32);
+    // 真的没能发出去的**块 id**（新鲜度闸门丢的、限速桶丢的、队列满拒的）。管线拿到这份
+    // id 才有资格只补那些块；留空 = 脱落来源没告诉我们掉了谁，那才走整帧兑现。
+    let lost_ids: Arc<std::sync::Mutex<LossAccount>> =
+        Arc::new(std::sync::Mutex::new(LossAccount::default()));
     let sent_cnt = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dropped_cnt = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stale_cnt = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -998,11 +1074,21 @@ pub async fn run(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let shed_cnt = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // 丢包注入的读数在 `ess_transport::DROPPED_LOSSY`（`ESS_DROP_EVERY`，测量台用）：注入点
+    // 必须在 `send_wire` 里的**包**一层，不是会话侧的消息层——一条 255 块的 Update 在会话侧
+    // 只是一条消息。上一版放在消息层，四臂 `inj` 全 0，量的根本不是丢包。
+    // 花在 `publish_data` 上的累计时间（µs）。要回答的问题很具体：一次半屏变化要拆成
+    // 140 条 16 KB 小包，逐条 await 串行推——如果观看到的画面是"一块块爬上来"，那要么
+    // 是编码/链路，要么就是这个发送循环本身。没有读数之前这三种分不开。
+    let send_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut send_prev = 0u64;
     {
         let lp = lp.clone();
         let sent = sent_cnt.clone();
         let stale = stale_cnt.clone();
         let shed = shed_cnt.clone();
+        let lost = lost_ids.clone();
+        let send = send_us.clone();
         tokio::spawn(async move {
             let mut msg_id = 0u32;
             let mut tokens = 0f64;
@@ -1010,6 +1096,9 @@ pub async fn run(
             while let Some(b) = wire_rx.recv().await {
                 if !b.baseline && b.at.elapsed() >= fresh {
                     stale.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut v) = lost.lock() {
+                        merge_lost(&mut v, batch_tile_ids(&b.msgs));
+                    }
                     continue;
                 }
                 for m in &b.msgs {
@@ -1037,12 +1126,14 @@ pub async fn run(
                             }
                         }
                     }
+                    let t_send = Instant::now();
                     match ess_transport::send_wire(&lp, m, &mut msg_id).await {
                         Ok(()) => {
                             sent.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => eprintln!("发送失败: {e}"),
                     }
+                    send.fetch_add(t_send.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
             }
         });
@@ -1152,6 +1243,20 @@ pub async fn run(
                     if let Ok(v) = std::env::var("ESS_MOTION_HOLD") {
                         if let Ok(n) = v.parse() { p.hold_frames = n; }
                     }
+                    // 图块选码：0 = 强制无损（验收臂的单变量对照，旧"逐字节相等"契约靠它复跑），
+                    // 默认按"省几倍"降级到 JPEG（见 `CodecSet::encode_by_cost`）。
+                    if let Ok(v) = std::env::var("ESS_LOSSY_SAVE_X") {
+                        if let Ok(n) = v.parse::<u32>() {
+                            if n == 0 {
+                                p.lossy_trial_floor = usize::MAX; // 永不比价 ⇒ 永不降级
+                            } else {
+                                p.lossy_save_x = n;
+                            }
+                        }
+                    }
+                    if let Ok(v) = std::env::var("ESS_LOSSY_SAVE_X_EDGY") {
+                        if let Ok(n) = v.parse() { p.lossy_save_x_edgy = n; }
+                    }
                     // 预热上限（ms）：0 = 关掉预热，回到"决定即交接"（反向对照臂用）
                     if let Ok(v) = std::env::var("ESS_WARM_MS") {
                         if let Ok(n) = v.parse::<u64>() {
@@ -1186,11 +1291,28 @@ pub async fn run(
                     // 只记案，不在这里决定补什么：管线会拿下一次观看端报告裁决——报告指出缺口就
                     // 交给逐块修复，报告说"全齐"才升级（#53）。直接在会话里 force_full() 会把
                     // 执行器自己的证明顶掉（实测 forced-plane 因此又变成 forced_plane=0）。
-                    p.note_link_loss();
+                    // 掉的是哪些块通常我们知道（闸门/队列丢的都是 Update 批次）——把 id 一起
+                    // 记案，管线才可能只补那些块。id 不知情的脱落（例如外部只报了个计数）仍然
+                    // 走整帧兑现，那是 #52/#53 钉住的行为。
+                    let acct = lost_ids
+                        .lock()
+                        .map(|mut v| std::mem::take(&mut *v))
+                        .unwrap_or_default();
+                    if acct.unknown || acct.ids.is_empty() {
+                        p.note_link_loss();
+                    } else {
+                        p.note_link_loss_tiles(&acct.ids);
+                    }
                     loss_seen = false;
                     rebuild_at = Instant::now();
                     emit(Event::Log(format!(
-                        "链路累计脱落 {lost} 条 → 记案，等下一次报告裁决（无损通路按产出提交，丢了不会自己回来）"
+                        "链路累计脱落 {lost} 条 → 记案，等下一次报告裁决（可知块 {}，{}）",
+                        if acct.unknown { 0 } else { acct.ids.len() },
+                        if acct.unknown {
+                            "含说不清块 id 的内容，整帧兜底那条路保留"
+                        } else {
+                            "块 id 全可知，补账按块不兑整帧"
+                        }
                     )));
                 }
                 let t0 = Instant::now();
@@ -1274,7 +1396,7 @@ pub async fn run(
                 match encoded {
                     Ok(msgs) => {
                         msg_n += msgs.len() as u64;
-                        enqueue(&wire_tx, &dropped_cnt, msgs).await;
+                        enqueue(&wire_tx, &dropped_cnt, &lost_ids, msgs).await;
                         frame_n += 1;
                     }
                     Err(e) => emit(Event::Error(format!("编码失败: {e}"))),
@@ -1293,7 +1415,7 @@ pub async fn run(
                         p.force_full();
                     }
                     match p.on_report(layout_id, &versions, &epochs, now) {
-                        Ok(msgs) => enqueue(&wire_tx, &dropped_cnt, msgs).await,
+                        Ok(msgs) => enqueue(&wire_tx, &dropped_cnt, &lost_ids, msgs).await,
                         Err(e) => emit(Event::Error(format!("重发编码失败: {e}"))),
                     }
                 }
@@ -1746,7 +1868,7 @@ pub async fn run(
                     .map(|p| (p.budget_bps(), p.stats.budget_forced))
                     .unwrap_or((0, 0));
                 eprintln!(
-                    "STATS fps_cap={} avail={:.2}Mbps egress={:.2}Mbps audio={:.1}kbps(audiotgt={:.0} pkt={:.0}/s) rtt={:.1}ms loss={:.3} rx_rtt={:.1}ms target={:.2}Mbps enc={}x{}@{:.1} vsent={:.1} ql_bw={:.2} nack={:.0} qdelay={}ms qp={} bw_limited={} cpu_limited={} res_changes={} tile_budget={} forced_plane={} lag={}ms q={} stale={} enc_press={} strain={} warm={} strain_forced={} tile_enc={:.1}ms tile_diff={:.1}ms tile_pack={:.1}ms tile_detect={:.1}ms feed={:.1}ms feed_max={:.1}ms pipe={:.1}ms pipe_max={:.1}ms push_new={:.1}ms push_cvt={:.1}ms push_cap={:.1}ms tiles={} updates={} egress_cap={} shed={}",
+                    "STATS fps_cap={} avail={:.2}Mbps egress={:.2}Mbps audio={:.1}kbps(audiotgt={:.0} pkt={:.0}/s) rtt={:.1}ms loss={:.3} rx_rtt={:.1}ms target={:.2}Mbps enc={}x{}@{:.1} vsent={:.1} ql_bw={:.2} nack={:.0} qdelay={}ms qp={} bw_limited={} cpu_limited={} res_changes={} tile_budget={} forced_plane={} lag={}ms q={} stale={} enc_press={} strain={} warm={} strain_forced={} tile_enc={:.1}ms tile_diff={:.1}ms tile_pack={:.1}ms tile_detect={:.1}ms feed={:.1}ms feed_max={:.1}ms pipe={:.1}ms pipe_max={:.1}ms push_new={:.1}ms push_cvt={:.1}ms push_cap={:.1}ms tile_bytes={} tiles={} updates={} egress_cap={} shed={} missing={} behind={} reports={} send={:.0}ms inj={} lossy={}",
                     fps_ctl.load(Ordering::Relaxed),
                     link.avail_bps / 1e6,
                     link.egress_bps / 1e6,
@@ -1788,23 +1910,39 @@ pub async fn run(
                     push_new_ms,
                     push_cvt_ms,
                     push_cap_ms,
+                    bytes,
                     tiles,
                     updates,
                     egress_cap,
-                    shed_cnt.load(Ordering::Relaxed)
+                    shed_cnt.load(Ordering::Relaxed),
+                    // 上一份观看端报告里「发送端版本比它新」的块数与「落后 ≥2 版」的块数。
+                    // 前者是**收敛曲线**的读数：一次大面积变化后它应当在几百毫秒内回到 0，
+                    // 回不去就是用户说的"很多图块慢慢覆盖"；后者用来区分"我们没发"和"它啃不动"。
+                    pipeline.as_ref().map(|p| p.ctl.last_gap).unwrap_or(0),
+                    pipeline.as_ref().map(|p| p.ctl.last_behind).unwrap_or(0),
+                    report_cnt.load(Ordering::Relaxed),
+                    (send_us.load(Ordering::Relaxed) - send_prev) as f64 / 1000.0,
+                    ess_transport::DROPPED_LOSSY.load(Ordering::Relaxed),
+                    pipeline.as_ref().map(|p| p.stats.tiles_lossy).unwrap_or(0)
                 );
             }
             // 每秒的最大积压年龄报完就清零（要的是"这一秒最旧的帧有多旧"）
             lag_max_ms = 0;
-            let (repairs, repair_tiles, resends, throttled, escalations) = match &pipeline {
+            send_prev = send_us.load(Ordering::Relaxed);
+            // 两条账必须分开印。`claims` = 观看端报告**认领**的块数（在途抑制之前计数，
+            // 所以它含被摘掉的那些）；`resends` = 真正重新编码并交给人的块数。
+            // 以前这里把 `report_resends` 印成 `resends=`，于是"重发 137 块"与"同一秒
+            // `tile_bytes` 一分没花"摆在同一行，读起来像仪表坏了（实测 z60c 就是这么起的疑）。
+            let (repairs, repair_tiles, resends, claims, throttled, escalations) = match &pipeline {
                 Some(p) => (
                     p.stats.repairs,
                     p.stats.repair_tiles,
+                    p.ctl.stats.resends,
                     p.ctl.stats.report_resends,
                     p.ctl.stats.repair_throttled,
                     p.ctl.stats.escalations,
                 ),
-                None => (0, 0, 0, 0, 0),
+                None => (0, 0, 0, 0, 0, 0),
             };
             if perf {
                 eprintln!(
@@ -1815,11 +1953,11 @@ pub async fn run(
                 eprintln!(
                     "MOTION frames={motion} bytes={motion_bytes} dropped={mdrop} full={fulls} video={video_frames} vmode={vmode} switches={switches}"
                 );
-                // 报告驱动的修复链有没有真的动起来：`resends` = 按观看端报告重发的块数，
-                // `throttled` = 被 §6.6 修复预算扣下的，`escalations` = 升级为整帧的次数。
-                // 窄链路脱落能不能收敛就看这三个数（#51）。
+                // 报告驱动的修复链有没有真的动起来：`claims` = 报告认领的块数，
+                // `resends` = 其中真正重发的块数，`throttled` = 被 §6.6 修复预算扣下的，
+                // `escalations` = 升级为整帧的次数。窄链路脱落能不能收敛看后三条（#51）。
                 eprintln!(
-                    "REPAIR exits={repairs} tiles={repair_tiles} resends={resends} throttled={throttled} escalations={escalations}"
+                    "REPAIR exits={repairs} tiles={repair_tiles} resends={resends} claims={claims} throttled={throttled} escalations={escalations}"
                 );
                 eprintln!(
                     "PERF 1s frames={frame_n} msgs={msg_n} enc={:.0}ms sent={sent} qdrop={} audio_total={}",
@@ -1869,7 +2007,269 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::ProductMode;
+    use super::{enqueue, merge_lost, Batch, LossAccount, ProductMode};
+    use ess_core::wire::WireMsg;
+
+    /// 滚动中让观看端在**这一步内容落地之前**取快照交报告（现场那 ~0.5 s 报告往返的形状），
+    /// 每一步都断言画布逐字节等于当时那一帧。为 #11 唯一幸存的假设而写：报告重发的像素取自
+    /// `state.last_sent`（`crates/ess-core/src/pipeline.rs:1067`），而版本向量在**产出那一刻**提交
+    /// （同文件 295 行注释）——两者不是同一帧就会"盖错内容、记对版本"，画布一整条边停在旧的。
+    /// **这个形状的结果：30 步逐帧逐字节一致，中途快照没造出缺口** ⇒ 现场那条"整条顶边差一步"
+    /// 还没被这个机制解释。
+    ///
+    /// 滚动 **加上观看端的周期报告**：快照取在这一步的内容落地之前，内容落地之后才把报告的
+    /// 答复发出去——这正是现场那 ~0.5 s 报告往返里发生的事，也是上一条逐帧精确的测试唯一没覆盖的一维。
+    ///
+    /// 为什么写这条：现场纯滚动臂（`ESS_DEMO_BLOCK=0`，`switches=0`、平面一秒没开、滚动宣告 77 次）
+    /// 仍然会红，差异形状是**整条顶部块行**（y0..63、20 块、75 200 像素）——滚动平移腾出来的那条边。
+    /// 唯一还没被排除的机制（#11）：报告重发的像素取自 `state.last_sent`，而版本向量在产出那一刻
+    /// 就提交了；两者不是同一帧时，就会"盖错内容、记对版本"。这条测试就是判它的。
+    #[test]
+    fn a_scroll_with_mid_flight_viewer_reports_stays_pixel_exact() {
+        use ess_capture::{ScreenSource, SyntheticScreen};
+        use ess_core::model::Message;
+        let mut screen = SyntheticScreen {
+            w: 640,
+            h: 360,
+            animate_frames: 40,
+            animate_delay: 0,
+            flash: false,
+            block: false,
+            step_at: 0,
+            video_like: false,
+        };
+        let pal = ess_codec_palette::PaletteZstdCodec::default();
+        let png = ess_codec_png::PngCodec;
+        let codecs = ess_core::pipeline::CodecSet { codecs: &[&pal, &png] };
+        let f0 = screen.frame(0);
+        let mut send = ess_core::pipeline::SendPipeline::new(f0.clone(), codecs);
+        send.motion_enabled = false;
+        let mut recv = ess_core::pipeline::RecvPipeline::new(codecs);
+
+        let feed = |recv: &mut ess_core::pipeline::RecvPipeline, msgs: Vec<ess_core::wire::WireMsg>| {
+            for m in &msgs {
+                let b = ess_core::wire::encode(m).unwrap();
+                recv.on_wire(&ess_core::wire::decode(&b).unwrap()).unwrap();
+            }
+        };
+        feed(&mut recv, send.on_frame(&f0).unwrap());
+
+        let mut replies = 0u32;
+        for i in 1..30u32 {
+            let f = screen.frame(i as u64 * 33_333);
+            let step = send.on_frame(&f).unwrap();
+            // 快照先取（这一步的内容还没落地）
+            let snap = if i % 3 == 2 { Some(recv.report()) } else { None };
+            feed(&mut recv, step);
+            if let Some(Message::Report { layout_id, versions, epochs }) = snap {
+                let reply = send
+                    .on_report(layout_id, &versions, &epochs, i as u64 * 500)
+                    .unwrap();
+                replies += reply.len() as u32;
+                feed(&mut recv, reply);
+            }
+            let bad = recv
+                .canvas
+                .px
+                .iter()
+                .zip(f.px.iter())
+                .position(|(a, b)| a != b);
+            if let Some(o) = bad {
+                let px = o / 4;
+                panic!(
+                    "第 {i} 步画布与画面不一致：首个差异在 x={} y={}（块行 {}，顶行=0；底行窄块从 y=320 起），报告答复共 {} 条消息",
+                    px % 640,
+                    px / 640,
+                    (px / 640) / 64,
+                    replies
+                );
+            }
+        }
+        // 这份夹具在 30 步里一次报告答复都没产生（中途快照没造出缺口），所以 `replies` 只当读数。
+        // 要判"丢一步之后要回来的是不是当前内容"，注入步必须按消息实际落点选，不能猜步号。
+        eprintln!("滚动 + 中途快照：30 步逐帧逐字节一致；报告答复共 {replies} 条消息");
+    }
+
+    /// 纯滚动（不进平面）时，观看端画布必须**每一帧**都逐字节等于当时那一帧。
+    ///
+    /// 为什么写这条：现场 `ESS_DEMO_BLOCK=0` 的臂（`switches=0`、平面一秒没开、滚动宣告 77 次）
+    /// 仍然会红，而且差异形状是**整条顶部块行**（1280x720 上 y0..63、20 块、75 200 像素）——
+    /// 也就是滚动平移腾出来的那条边没被正确回填。逐帧比对能把第一次发散钉在第几步。
+    #[test]
+    fn a_scrolling_scene_stays_pixel_exact_on_every_step() {
+        use ess_capture::{ScreenSource, SyntheticScreen};
+        let mut screen = SyntheticScreen {
+            w: 640,
+            h: 360,
+            animate_frames: 40,
+            animate_delay: 0,
+            flash: false,
+            // 纯滚动：没有独立移动的物体，滚动检测器该认出 dy
+            block: false,
+            step_at: 0,
+            video_like: false,
+        };
+        let pal = ess_codec_palette::PaletteZstdCodec::default();
+        let png = ess_codec_png::PngCodec;
+        let codecs = ess_core::pipeline::CodecSet { codecs: &[&pal, &png] };
+        let f0 = screen.frame(0);
+        let mut send = ess_core::pipeline::SendPipeline::new(f0.clone(), codecs);
+        send.motion_enabled = false;
+        let mut recv = ess_core::pipeline::RecvPipeline::new(codecs);
+
+        let mut scroll_msgs = 0u32;
+        for i in 0..30u32 {
+            let f = screen.frame(i as u64 * 33_333);
+            for m in &send.on_frame(&f).unwrap() {
+                if matches!(m, ess_core::wire::WireMsg::Scroll { .. }) {
+                    scroll_msgs += 1;
+                }
+                let b = ess_core::wire::encode(m).unwrap();
+                recv.on_wire(&ess_core::wire::decode(&b).unwrap()).unwrap();
+            }
+            let bad = recv
+                .canvas
+                .px
+                .iter()
+                .zip(f.px.iter())
+                .position(|(a, b)| a != b);
+            if let Some(o) = bad {
+                let px = o / 4;
+                panic!(
+                    "第 {i} 步（ts={} ms）画布与画面不一致：首个差异像素在 x={} y={}；滚动宣告 {} 条；块行 {}（底行窄块从 y=320 起）",
+                    i as u64 * 33,
+                    px % 640,
+                    px / 640,
+                    scroll_msgs,
+                    (px / 640) / 64
+                );
+            }
+        }
+        assert!(scroll_msgs > 0, "这一臂本该走滚动宣告（现场 77 条），一条都没发出来说明夹具没被识别成平移");
+    }
+
+    /// 现场形状的可复现版：合成屏一路滚动（内容每帧都在变），预算执行器把画面交给媒体平面，
+    /// 按住几秒后松开、退回无损并发精确修复——观看端画布必须逐字节等于退出那一刻的画面。
+    ///
+    /// 为什么写这条：存档的失败臂 `target/motion-fail` 就是这个形状——平面按了 5 秒（成功臂 4 秒），
+    /// 终帧差最底行一个窄块（1280x720 上 x768..831 y704..719），而 `stale`/`missing`/`behind` 全程 0、
+    /// 一条脱落记案都没有、退出修复块数与成功臂同为 238：**版本对得上，像素差一步**。
+    /// 360 高配 64 的块 ⇒ 底行是 40 像素的窄块，正是出问题那一行的形状。
+    #[test]
+    fn a_plane_held_over_a_scrolling_scene_returns_pixel_exact() {
+        use ess_capture::{ScreenSource, SyntheticScreen};
+        let mut screen = SyntheticScreen {
+            w: 640,
+            h: 360,
+            // 5 步之后画面冻结：退出平面要等"画面 settle"，冷启动不是切换
+            animate_frames: 5,
+            animate_delay: 0,
+            flash: false,
+            block: true,
+            step_at: 0,
+            video_like: false,
+        };
+        let pal = ess_codec_palette::PaletteZstdCodec::default();
+        let png = ess_codec_png::PngCodec;
+        let codecs = ess_core::pipeline::CodecSet { codecs: &[&pal, &png] };
+        let mut send = ess_core::pipeline::SendPipeline::new(screen.frame(0), codecs);
+        send.video_plane = true;
+        // 隔离出预算这一条判据：不许走 JPEG 运动通路盖画布
+        send.motion_enabled = false;
+        send.hold_frames = 2;
+        let mut recv = ess_core::pipeline::RecvPipeline::new(codecs);
+
+        let mut last = screen.frame(0);
+        let m0 = send.on_frame(&last).unwrap();
+        for m in &m0 {
+            let b = ess_core::wire::encode(m).unwrap();
+            recv.on_wire(&ess_core::wire::decode(&b).unwrap()).unwrap();
+        }
+        assert_eq!(recv.canvas.px, last.px, "首帧落画");
+
+        // 30 fps 走 30 步：第 4 步压预算逼出平面，第 14 步松开等迟滞退出
+        for i in 1..30u32 {
+            if i == 4 {
+                send.set_budget_bps(200_000);
+            }
+            if i == 14 {
+                send.set_budget_bps(0);
+            }
+            last = screen.frame(i as u64 * 33_333);
+            for m in &send.on_frame(&last).unwrap() {
+                let b = ess_core::wire::encode(m).unwrap();
+                recv.on_wire(&ess_core::wire::decode(&b).unwrap()).unwrap();
+            }
+        }
+        assert!(send.stats.video_on >= 1, "这一臂应当真的被预算逼进过平面");
+        assert!(!send.video_mode(), "平面松开后应退回无损");
+        let bad = recv
+            .canvas
+            .px
+            .iter()
+            .zip(last.px.iter())
+            .position(|(a, b)| a != b);
+        if let Some(o) = bad {
+            let px = o / 4;
+            panic!(
+                "退回无损后画布与当时画面不一致：首个不同像素在 x={} y={}（底行窄块从 y=320 开始），平面进入 {} 次、退出修复 {} 块",
+                px % 640,
+                px / 640,
+                send.stats.video_on,
+                send.stats.repair_tiles
+            );
+        }
+    }
+
+    /// 静止画面每帧产出的**空批次**不得占用发送队列。
+    ///
+    /// 占用的后果不是浪费一次 channel op：空批次会在新鲜度闸门里 aging 成「脱落」，
+    /// 脱落累计去设 `loss_claimed`，于是观看端一份「我全对上了」的报告被读成「提交即
+    /// 记账把缺口掩盖了」，每 1.5 s 补一次整帧重建。实测 1080p 半屏单帧突变 + 之后完全
+    /// 静止：`stale` 0→68、`tile_bytes` 2.75→11.57 MB、`forced_plane` 0→2、
+    /// `switches` 0→4 —— 其中 9 MB 是这么白花出来的，观看端从头到尾一块都不缺。
+    #[tokio::test]
+    async fn empty_batches_never_enter_the_send_queue() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Batch>(2);
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        let lost = std::sync::Mutex::new(LossAccount::default());
+
+        enqueue(&tx, &dropped, &lost, Vec::new()).await;
+        assert_eq!(rx.capacity(), 2, "空批次占了发送队列的位");
+
+        enqueue(
+            &tx,
+            &dropped,
+            &lost,
+            vec![WireMsg::State {
+                layout_id: 1,
+                cols: 2,
+                rows: 2,
+                versions: vec![],
+                epochs: vec![],
+            }],
+        )
+        .await;
+        assert_eq!(rx.capacity(), 1, "非空批次必须入队");
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "队列没满不该记脱落"
+        );
+    }
+
+    /// 脱落账本：只要掺进一次**叫不出块 id** 的脱落（JPEG 运动帧那一类），整笔账就必须
+    /// 退回"整帧兜底"那条路。实测把它放宽成"有些 id 就按块补"，`motion-stays-lossless`
+    /// 的"退回无损后画布逐字节等于期望终帧"当场挂——省字节不能省掉正确性。
+    #[test]
+    fn loss_account_falls_back_when_any_drop_has_no_tile_ids() {
+        use ess_core::model::TileId;
+        let mut a = LossAccount::default();
+        merge_lost(&mut a, vec![TileId(0), TileId(1)]);
+        assert!(!a.unknown && a.ids.len() == 2, "Update 批次的脱落应按块记账");
+        merge_lost(&mut a, Vec::new());
+        assert!(a.unknown, "说不清块 id 的脱落必须把整帧兜底那条路留回来");
+    }
 
     /// 进入视频平面的送入尺寸 = 请求码率能不能装满尺寸跑帧率的直接读数。
     /// 数值对着 1280x720@30 的实测：0.09 bpp（平衡档自动码率 2 488 320 bps）实测

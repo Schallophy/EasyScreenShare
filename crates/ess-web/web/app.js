@@ -20,6 +20,7 @@ let viewer = 0;
 let feedPtr = 0, feedCap = 0;
 let reportPtr = 0, reportCap = 65536;
 let diagPtr = 0;
+let dirtyPtr = 0;
 let img = null, img32 = null, curW = 0, curH = 0;
 let drawnSerial = 0;
 let frames = 0, fps = 0, lastFpsAt = performance.now(), vPrev = 0;
@@ -31,8 +32,8 @@ let videoArmed = true;  // 视频轨已交出 on 之后的新画面（未 armed 
 let vArmedBase = 0;     // on 到达时的累计解码帧数
 let aTrack = null;      // 已订阅的系统声音轨
 let soundEl = null;     // 声音挂在独立的 <audio> 上（video 元素是 muted 的，为的是绕开自动播放限制）
-let soundMuted = false; // 观看端与分享端同机时必须能一键静音，否则环回会把这里放的声音再抓一遍
-const state = { msgs: 0, errors: 0, w: 0, h: 0, serial: 0, feed_ms: 0, feed_n: 0, dropped: 0, duty: 0 };
+let soundMuted = true; // 默认静音：观看端与分享端同机时外放会被环回再抓一遍；用户也要求默认不开声音。要听就点"声音 开"
+const state = { msgs: 0, errors: 0, w: 0, h: 0, serial: 0, feed_ms: 0, feed_n: 0, dropped: 0, loss: 0, duty: 0 };
 
 // 观看端新鲜度闸门（手机上最关键的一条）。RTC 数据通道在浏览器侧没有反压：解码跟不上
 // 到达速率时，消息就堆在事件循环里按序播放——表现正是"时间轴一直漂移、观看端不追最新
@@ -75,6 +76,7 @@ function hudText() {
   const snd = aTrack ? (soundMuted ? '声音:关' : '声音:开') : '声音:无';
   return `${s}  ${state.w}x${state.h}  ${plane}  ${rate}  ${snd}  msgs=${state.msgs}` +
     (state.dropped ? ` 丢=${state.dropped}` : '') +
+    (state.loss ? ` 漏=${state.loss}` : '') +
     (shedOn ? ` 解码${Math.round(state.duty * 100)}%` : '') +
     (lastError ? `\n${lastError}` : '');
 }
@@ -96,11 +98,16 @@ async function loadWasm() {
   }
   ex = inst.instance.exports;
   mem = ex.memory;
+  // 浏览器可能留着上一版的 wasm（文件名固定），导出对不上时宁可立刻说清楚
+  if (typeof ex.ess_viewer_dirty !== 'function') {
+    throw new Error('ess_web.wasm 过旧：缺 ess_viewer_dirty，请重跑 scripts/build-web.sh');
+  }
   viewer = ex.ess_viewer_new();
-  feedCap = 1 << 17; // 单条数据消息实测 ≤ 16 KB，留足余量
+  feedCap = 1 << 17; // 单条数据消息上限 = MAX_MESSAGE_BYTES(60 KB) + 头部，留足余量
   feedPtr = ex.ess_alloc(feedCap);
   reportPtr = ex.ess_alloc(reportCap);
   diagPtr = ex.ess_alloc(128);
+  dirtyPtr = ex.ess_alloc(16);
 }
 
 function feed(bytes) {
@@ -130,44 +137,65 @@ function feed(bytes) {
 }
 
 function ensureCanvas(w, h) {
-  if (w === curW && h === curH && canvas.width === w && canvas.height === h) return;
+  if (w === curW && h === curH && canvas.width === w && canvas.height === h) return false;
   curW = w; curH = h;
   canvas.width = w;
   canvas.height = h;
   img = ctx.createImageData(w, h);
   img32 = new Uint32Array(img.data.buffer);
   drawnSerial = 0;
+  return true;
 }
 
 // 画布内存是 BGRA（原生管线内部格式），ImageData 要 RGBA：交换 R/B。
+//
+// 交换与上传只覆盖**脏矩形**：整幅 1080p 是按帧大小付钱，实测一次大面积更新
+// 就把解码占用顶过 shed 闸门（44 %），后续更新被本机丢掉，表现成"很多个图块
+// 慢慢覆盖"。变化面积才是这件事的真实代价。
 function draw() {
   const w = ex.ess_viewer_width(viewer) >>> 0;
   const h = ex.ess_viewer_height(viewer) >>> 0;
   const serial = ex.ess_viewer_serial(viewer) >>> 0;
   state.w = w; state.h = h; state.serial = serial;
   if (w === 0 || h === 0) return;
-  ensureCanvas(w, h);
-  if (serial === drawnSerial) return;
+  const resized = ensureCanvas(w, h);
+  const has = ex.ess_viewer_dirty(viewer, dirtyPtr);
+  const dv = new Uint32Array(mem.buffer, dirtyPtr, 4);
+  if (!has && serial === drawnSerial) return;
+  // 尺寸刚变时 img 里除脏区之外是空的，必须整幅上传
+  let x = 0, y = 0, bw = w, bh = h;
+  if (has && !resized) {
+    x = dv[0]; y = dv[1]; bw = dv[2]; bh = dv[3];
+  }
   const ptr = ex.ess_viewer_canvas(viewer) >>> 0;
-  const n = w * h;
+  const x1 = x + bw, y1 = y + bh;
   if (ptr % 4 === 0) {
-    const src = new Uint32Array(mem.buffer, ptr, n);
-    for (let i = 0; i < n; i++) {
-      const v = src[i];
-      img32[i] = (v & 0xff00ff00) | ((v & 0xff) << 16) | ((v >>> 16) & 0xff);
+    const src = new Uint32Array(mem.buffer, ptr, w * h);
+    for (let row = y; row < y1; row++) {
+      const base = row * w;
+      for (let col = x; col < x1; col++) {
+        const i = base + col;
+        const v = src[i];
+        img32[i] = (v & 0xff00ff00) | ((v & 0xff) << 16) | ((v >>> 16) & 0xff);
+      }
     }
   } else {
-    const src = new Uint8Array(mem.buffer, ptr, n * 4);
+    const src = new Uint8Array(mem.buffer, ptr, w * h * 4);
     const dst = img.data;
-    for (let i = 0; i < n; i++) {
-      const o = i * 4;
-      dst[o] = src[o + 2];
-      dst[o + 1] = src[o + 1];
-      dst[o + 2] = src[o];
-      dst[o + 3] = src[o + 3];
+    for (let row = y; row < y1; row++) {
+      for (let col = x; col < x1; col++) {
+        const o = (row * w + col) * 4;
+        dst[o] = src[o + 2];
+        dst[o + 1] = src[o + 1];
+        dst[o + 2] = src[o];
+        dst[o + 3] = src[o + 3];
+      }
     }
   }
-  ctx.putImageData(img, 0, 0);
+  // `putImageData` 的 dx/dy 是整幅 image 的落点，脏矩形只是"只写哪一块"：
+  // 写成 `(img, x, y, x, y, …)` 会把源 (x,y) 画到 (2x,2y)，偏移块整块错位/裁掉。
+  // 要让脏块原地更新，落点必须是 (0,0)。
+  ctx.putImageData(img, 0, 0, x, y, bw, bh);
   drawnSerial = serial;
   frames++;
 }
@@ -244,12 +272,16 @@ function tick() {
   state.w = ex.ess_viewer_width(viewer) >>> 0;
   state.h = ex.ess_viewer_height(viewer) >>> 0;
   state.serial = ex.ess_viewer_serial(viewer) >>> 0;
+  // 序列空洞（diag 末槽）：没按序到达的发送端消息数。口径要说清——本地 shed 闸门挡下的
+  // 消息同样不会进 wasm，所以这个数含「链路丢」与「本机解码闸门丢」两部分；闸门关掉
+  // （平时 duty 不高）时它就等于链路丢的量。与 丢=（只数本机闸门）分开看。
+  const dn = ex.ess_viewer_diag(viewer, diagPtr, 32);
+  if (dn > 17) state.loss = new Uint32Array(mem.buffer, diagPtr, dn)[17];
   hud.textContent = hudText();
 }
 
 function loop() {
   syncPlane();
-  const t0 = performance.now();
   // 闸门信箱在每帧开头解开：一次只解一条最新的，画布每帧都有新内容，队列深度恒 ≤1。
   // 放在 draw 之前，这一条最新更新就跟着本次上屏画出去。
   if (shedMailbox) {
@@ -257,6 +289,10 @@ function loop() {
     shedMailbox = null;
     feed(pending);
   }
+  // t0 在信箱解开之后：feed 自己已经按毫秒计入 duty，从这里再包一份会把同一段
+  // 工时数两遍——闸门开着时几乎每条更新都走信箱，于是 duty 被系统性抬高，闸门
+  // 越来越关得死。
+  const t0 = performance.now();
   draw();
   // 解码占用按 feed + 画布上传两段算：draw 把 ImageData 推给 canvas，1080p 下
   // 每帧也是几毫秒，它和 feed 抢的是同一条主线程。
@@ -398,16 +434,29 @@ async function main() {
     syncPlane();
     tick();
   }, 250);
-  setInterval(() => {
+  let gapsReported = 0;
+  function sendReport() {
     if (!connected) return;
-    const n = ex.ess_viewer_report(viewer, reportPtr, reportCap);
+    const n = ex.ess_viewer_report(viewer, reportPtr, reportCap, Date.now());
     if (n > 0) {
+      gapsReported = state.loss;
       const bytes = new Uint8Array(mem.buffer, reportPtr, n).slice();
       room.localParticipant.publishData(bytes, { reliable: true }).catch((e) => {
         lastError = '报告发送失败: ' + e.message;
       });
     }
-  }, 500);
+  }
+  setInterval(sendReport, 500);
+  // 空洞早报：看见新的链路空洞就立刻补一份报告，不等下一个 500 ms 刻度。实测半屏照片类突变
+  // 约四分之三当秒到齐，剩下那一截纯粹在等这份报告的往返；报告只是几 KB 的上行可靠消息，
+  // 早发不动下行带宽，也不动新鲜度判定（发送端仍按报告的版本向量算差集）。
+  //
+  // `!shedOn` 是必需的，不是保险：被本机闸门挡下的更新根本没进 wasm，所以它连自己的 seq 都没
+  // 被记过，后来者一比对就成了"洞"。闸门开着时去追这些洞，等于把新鲜度判定刚丢掉的内容又要
+  // 回来——那正是补账活锁的入口。
+  setInterval(() => {
+    if (!shedOn && state.loss > gapsReported) sendReport();
+  }, 250);
 
   // 验收钩子：像素哈希 / 采样，供自动化比对
   window.__ess = {
@@ -451,8 +500,8 @@ async function main() {
     videoFrames: videoFramesTotal,
     diag() {
       if (!diagPtr) return [];
-      ex.ess_viewer_diag(viewer, diagPtr, 17);
-      return Array.from(new Uint32Array(mem.buffer, diagPtr, 17));
+      const n = ex.ess_viewer_diag(viewer, diagPtr, 32);
+      return Array.from(new Uint32Array(mem.buffer, diagPtr, n));
     },
   };
 }

@@ -15,6 +15,7 @@ enum TileCodec {
   TILE_CODEC_PALETTE_ZSTD = 1;
   TILE_CODEC_PNG = 2;
   TILE_CODEC_RAW = 3;
+  TILE_CODEC_JPEG = 4;
 }
 
 enum PathKind {
@@ -104,6 +105,10 @@ message FullFrame {
   repeated uint32 epochs = 11;
   // 与 version_vec 一一对应的每块编码长度（data 为拼接流，由传输层再分片）
   repeated uint32 tile_lens = 12;
+  // 与 `tile_lens` 一一对应的每块编码；空 = 全部用上面那个 `codec`（兼容旧发送端）。
+  // 加它的理由：整帧只有一个编码器时，照片类桌面首屏只能整帧走 PNG——实测 1080p
+  // 3.72 MB，逐块按价是 1.67 MB（2.22×，459/510 块 JPEG）。
+  repeated TileCodec codecs = 13;
 }
 
 // 运动帧：整帧降采样 JPEG（有损）。大面积运动时替代逐块更新，

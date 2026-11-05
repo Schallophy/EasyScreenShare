@@ -304,6 +304,12 @@ pub struct SyntheticScreen {
     /// 滚动检测器认不出来），上方一条窄带横向飘字。用户的真实工作点是这个——播放基本
     /// 不动的视频、弹幕飘过；滚动型 demo 会让无损通路看起来比实际便宜一个数量级。
     pub video_like: bool,
+    /// 单帧大面积突变（0 = 关）：第 N 帧把左半屏一次性重绘，之后保持不变。
+    ///
+    /// 存在的理由：渐进动画里「一次大变化的代价」摊在几十帧上，丢包/丢批次读起来跟
+    /// 「链路慢」一模一样。要分清是丢还是慢，必须让整场会话只发生一次大变化。
+    /// 用 `ESS_DEMO_STEP` 选，配 `ESS_DEMO_ANIM=0`（背景全静止）使用。
+    pub step_at: u32,
 }
 
 impl SyntheticScreen {
@@ -316,6 +322,7 @@ impl SyntheticScreen {
             flash: false,
             block: true,
             video_like: false,
+            step_at: 0,
         }
     }
 
@@ -445,6 +452,24 @@ impl ScreenSource for SyntheticScreen {
                 for x in bx..(bx + 96).min(self.w) {
                     let s = y as usize * f.stride + x as usize * 4;
                     f.px[s..s + 4].copy_from_slice(&0xffff_0000u32.to_le_bytes());
+                }
+            }
+        }
+        // 单帧大面积突变：整场会话只发生这一次，之后左半屏固定不变。
+        //
+        // 内容刻意做成**照片类**（逐像素渐变 + 轻微哈希噪声）：调色板编码器会拒绝、
+        // 自动降级 PNG。真实屏幕上一次半屏切换就是这个量级，而平涂色每块只花几十字节，
+        // 用它量不出用户报的"很多个图块慢慢覆盖"（实测 255 块 = 11.4 KB，同秒落地）。
+        if self.step_at > 0 && idx >= self.step_at {
+            let half = self.w / 2;
+            for y in 0..self.h {
+                for x in 0..half {
+                    let s = y as usize * f.stride + x as usize * 4;
+                    let r = ((x / 3 + y / 7) ^ (x * y / 61)) as u8;
+                    let g = ((x * 2 + y) / 5) as u8;
+                    let b = ((x ^ y) as u32 * 31 / 17) as u8;
+                    let px = 0xff00_0000u32 | (r as u32) << 16 | (g as u32) << 8 | b as u32;
+                    f.px[s..s + 4].copy_from_slice(&px.to_le_bytes());
                 }
             }
         }

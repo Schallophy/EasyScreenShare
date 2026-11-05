@@ -49,7 +49,10 @@ pub enum WireMsg {
         frame_id: u32,
         w: u32,
         h: u32,
+        /// 整帧回退编码（旧发送端只给这一项）。
         codec: TileCodecId,
+        /// 与 `payloads` 一一对应的每块编码；空 = 全部用 `codec`。
+        codecs: Vec<TileCodecId>,
         versions: Vec<u32>,
         epochs: Vec<u32>,
         /// 按块 id 顺序
@@ -114,6 +117,7 @@ fn codec_to_proto(c: TileCodecId) -> i32 {
         TileCodecId::PaletteZstd => proto::TileCodec::PaletteZstd as i32,
         TileCodecId::Png => proto::TileCodec::Png as i32,
         TileCodecId::Raw => proto::TileCodec::Raw as i32,
+        TileCodecId::Jpeg => proto::TileCodec::Jpeg as i32,
     }
 }
 
@@ -122,12 +126,65 @@ fn codec_from_proto(v: i32) -> TileCodecId {
         v if v == proto::TileCodec::PaletteZstd as i32 => TileCodecId::PaletteZstd,
         v if v == proto::TileCodec::Png as i32 => TileCodecId::Png,
         v if v == proto::TileCodec::Raw as i32 => TileCodecId::Raw,
+        v if v == proto::TileCodec::Jpeg as i32 => TileCodecId::Jpeg,
         _ => TileCodecId::WebpLossless,
     }
 }
 
 fn header(seq: u32, layout_id: u32) -> proto::Header {
     proto::Header { seq, ts_us: 0, layout_id }
+}
+
+impl WireMsg {
+    /// 这条消息占用的序号；`State`/`Chunk`/`Nack` 不占（Chunk 只是某条消息的分片，
+    /// 它重组完才有 seq）。分片共享同一个 seq，所以一帧被切成 3 片不会被数成 2 个空洞。
+    pub fn seq(&self) -> Option<u32> {
+        match self {
+            WireMsg::Update { seq, .. }
+            | WireMsg::Scroll { seq, .. }
+            | WireMsg::Full { seq, .. }
+            | WireMsg::Motion { seq, .. }
+            | WireMsg::VideoMode { seq, .. } => Some(*seq),
+            _ => None,
+        }
+    }
+}
+
+/// 发送端消息序列的空洞计数——lossy 通道丢掉的更新**必须可见**。
+///
+/// 为什么需要它：大面积内容下无损平面只能交付约 20/30 帧每秒，缺的那些走的是 lossy
+/// 通道，**不进任何计数器**（观看端 `dropped` 数的是本地 shed 决策，发送端 `stale`/`shed`/`q`
+/// 数的是它自己丢的），于是用户只看到「很多个图块慢慢覆盖」而无从归因。`Receiver::last_seq`
+/// 这个字段本来就写了「用于空洞检测」，但全仓从未有人读写它。
+///
+/// 口径：只数 seq 的**跳号**，不数内容——漏一条算一次，被可靠通道补发回来的也算在里面
+/// （那是另一条 `REPAIR` 计数的事）。它是「有多少个更新没能按序到达」的下界观测。
+#[derive(Default, Debug, Clone, Copy)]
+pub struct SeqGaps {
+    /// 已见最大 seq；None = 还没收到过任何带 seq 的消息（首个不参与判洞）
+    max: Option<u32>,
+    pub gaps: u64,
+}
+
+impl SeqGaps {
+    /// 记一条消息的 seq。回退（乱序到更小的 seq）不算洞也不算重复，只忽略。
+    pub fn note(&mut self, seq: u32) {
+        match self.max {
+            None => self.max = Some(seq),
+            Some(m) => {
+                if seq > m + 1 {
+                    self.gaps += (seq - m - 1) as u64;
+                    self.max = Some(seq);
+                } else if seq > m {
+                    self.max = Some(seq);
+                }
+            }
+        }
+    }
+
+    pub fn seen_max(&self) -> Option<u32> {
+        self.max
+    }
 }
 
 pub fn encode(msg: &WireMsg) -> Result<Vec<u8>, WireError> {
@@ -169,7 +226,7 @@ pub fn encode(msg: &WireMsg) -> Result<Vec<u8>, WireError> {
                 }),
             })
         }
-        WireMsg::Full { seq, layout_id, frame_id, w, h, codec, versions, epochs, payloads } => {
+        WireMsg::Full { seq, layout_id, frame_id, w, h, codec, codecs, versions, epochs, payloads } => {
             let mut data = Vec::with_capacity(payloads.iter().map(|p| p.len()).sum());
             let mut lens = Vec::with_capacity(payloads.len());
             for p in payloads {
@@ -184,6 +241,7 @@ pub fn encode(msg: &WireMsg) -> Result<Vec<u8>, WireError> {
                 w: *w,
                 h: *h,
                 codec: codec_to_proto(*codec),
+                codecs: codecs.iter().map(|&c| codec_to_proto(c)).collect(),
                 data,
                 version_vec: versions.clone(),
                 meta_mac: Vec::new(),
@@ -310,6 +368,7 @@ pub fn decode(bytes: &[u8]) -> Result<WireMsg, WireError> {
                 w: f.w,
                 h: f.h,
                 codec: codec_from_proto(f.codec),
+                codecs: f.codecs.iter().map(|&c| codec_from_proto(c)).collect(),
                 versions: f.version_vec,
                 epochs: f.epochs,
                 payloads,
@@ -408,6 +467,7 @@ mod tests {
             w: 640,
             h: 480,
             codec: TileCodecId::Raw,
+            codecs: vec![TileCodecId::Raw, TileCodecId::Png, TileCodecId::PaletteZstd],
             versions: vec![1, 2, 3],
             epochs: vec![9, 9, 9],
             payloads: vec![vec![0xaa; 5], vec![], vec![0xbb; 7]],
@@ -431,6 +491,7 @@ mod tests {
             meta_mac: vec![],
             epochs: vec![1],
             tile_lens: vec![1, 1],
+            codecs: vec![],
         };
         let env = proto::Envelope { body: Some(proto::envelope::Body::Full(f.clone())) };
         let mut bytes = Vec::new();
@@ -443,5 +504,47 @@ mod tests {
         let mut bytes = Vec::new();
         prost::Message::encode(&env, &mut bytes).unwrap();
         assert!(matches!(decode(&bytes), Err(WireError::Malformed(_))));
+    }
+}
+
+#[cfg(test)]
+mod seq_gap_tests {
+    use super::SeqGaps;
+
+    #[test]
+    fn consecutive_is_not_loss() {
+        let mut g = SeqGaps::default();
+        for s in [1u32, 2, 3, 4] {
+            g.note(s);
+        }
+        assert_eq!(g.gaps, 0, "连续 seq 不该数出洞");
+        assert_eq!(g.seen_max(), Some(4));
+    }
+
+    #[test]
+    fn jump_counts_missing_messages() {
+        let mut g = SeqGaps::default();
+        g.note(1);
+        g.note(5);
+        assert_eq!(g.gaps, 3, "1→5 之间缺 2/3/4");
+    }
+
+    #[test]
+    fn first_message_never_counts_as_loss() {
+        // 观看端任何时候加入，第一条见到的 seq 可能已经很大：那不是丢帧
+        let mut g = SeqGaps::default();
+        g.note(9000);
+        assert_eq!(g.gaps, 0);
+    }
+
+    #[test]
+    fn split_parts_sharing_one_seq_are_not_gaps() {
+        // split_update 让一帧的多片共享同一 seq：重复与乱序都不许数成洞
+        let mut g = SeqGaps::default();
+        for s in [7u32, 7, 7, 6, 8] {
+            g.note(s);
+        }
+        assert_eq!(g.gaps, 0);
+        assert_eq!(g.seen_max(), Some(8));
     }
 }

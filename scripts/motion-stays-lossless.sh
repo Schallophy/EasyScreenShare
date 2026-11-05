@@ -46,7 +46,9 @@ fi
 "$BIN/ess-view" --no-window --seconds $((SECS - 3)) --dump "$OUT/received.ppm" >"$OUT/view.log" 2>&1 &
 VIEW=$!
 sleep 1
-ESS_PERF=1 ESS_DEMO_ANIM=$ANIM "$BIN/ess-share" --demo --fps "$FPS" --seconds "$SECS" >"$OUT/share.log" 2>&1 &
+# 这条臂的合同是"逐字节等于期望终帧"，所以显式钉在无损档：默认档会按"省几倍"把照片类块
+# 降级成有损（用户拍板"流畅度第一"），那与这条臂要证的东西不是同一件事。
+ESS_PERF=1 ESS_LOSSY_SAVE_X=0 ESS_DEMO_ANIM=$ANIM "$BIN/ess-share" --demo --fps "$FPS" --seconds "$SECS" >"$OUT/share.log" 2>&1 &
 SHARE=$!
 wait "$VIEW"; taskkill //PID "$SHARE" //F >/dev/null 2>&1; taskkill //IM ess-share.exe //F >/dev/null 2>&1; sleep 1
 

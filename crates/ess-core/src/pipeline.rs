@@ -24,6 +24,8 @@ pub struct SendStats {
     pub scrolls: u64,
     pub updates: u64,
     pub tiles_sent: u64,
+    /// 走有损图块（JPEG）发出去的块数：这是"流畅度优先"那条线真正生效的证据。
+    pub tiles_lossy: u64,
     pub bytes_encoded: u64,
     /// 分段耗时累计（µs）。存在的理由见 §14.7.8：会话侧 `tile_enc=` 的 t0 架在整个
     /// `on_frame` 外面（差分 + 策略判定 + 逐块编码 + 打包），归因不出到底是哪一段
@@ -82,6 +84,48 @@ impl<'c> CodecSet<'c> {
         Err(last)
     }
 
+    /// 按"流畅度优先"选码。规则只用**可算的价**，不看内容语义：
+    /// 1. 按顺序试无损链（调色板在前——平涂块它最便宜，实测中位 102 B，比 JPEG 还小 12 倍）；
+    /// 2. 首个成功的结果不超过 `trial_floor` 就直接收——64×64 照片块的 JPEG 中位也要 1.2 KB，
+    ///    再比一次只是白花 0.09–0.25 ms；
+    /// 3. 否则把有损候选也编出来，**省够 `save_x` 倍**才降级。实测照片块省 4.6×，
+    ///    而"照片背景上压字"只省 2.5× —— 后者降级会把字糊掉、还只省几十毫秒，不值。
+    pub fn encode_by_cost(
+        &self,
+        raw: &[u8],
+        w: u32,
+        h: u32,
+        trial_floor: usize,
+        save_x: u32,
+        save_x_edgy: u32,
+        edges_min: usize,
+    ) -> Result<(TileCodecId, Vec<u8>), CodecError> {
+        // 两档门限：**含高对比结构的块**（字、细线、图标边缘）要求省得更多才许降级。
+        // 依据（实测，`codec_cost.rs`）：满量程跳变计数在照片块=0、"照片上压字"=462、
+        // 文本块=192..544 —— 这条能算的量把"糊了会心疼"的那类分出来，且只花一次 4096 px 扫描。
+        let save_x = if full_scale_edges(raw, w, h) >= edges_min { save_x_edgy } else { save_x };
+        let mut last = CodecError::Unsupported;
+        for c in self.codecs {
+            match c.encode(raw, w, h) {
+                Ok(bytes) => {
+                    if c.lossy() || bytes.len() <= trial_floor {
+                        return Ok((c.id(), bytes));
+                    }
+                    for l in self.codecs.iter().filter(|l| l.lossy()) {
+                        if let Ok(lb) = l.encode(raw, w, h) {
+                            if lb.len().saturating_mul(save_x as usize) <= bytes.len() {
+                                return Ok((l.id(), lb));
+                            }
+                        }
+                    }
+                    return Ok((c.id(), bytes));
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
     pub fn decode_into(
         &self,
         id: TileCodecId,
@@ -105,6 +149,14 @@ pub struct SendPipeline<'c> {
     pub codecs: CodecSet<'c>,
     /// 关闭后全部走逐块差分（对照实验用）
     pub scroll_enabled: bool,
+    /// 选码门限：无损结果 ≤ 这个字节数就不试有损（64×64 照片块的 JPEG 中位 1.2 KB）。
+    pub lossy_trial_floor: usize,
+    /// 有损要省到这个倍数才允许降级（2 = 平缓的照片块省不到两倍就留无损）。
+    pub lossy_save_x: u32,
+    /// 含高对比结构（字/细线，见 `full_scale_edges`）的块要求省到这个倍数——更保守。
+    pub lossy_save_x_edgy: u32,
+    /// 满量程跳变达到多少算"含高对比结构"（实测：照片块 0，含字块 ≥192）。
+    pub lossy_edges_min: usize,
     pub stats: SendStats,
     seq: u32,
     frame_id: u32,
@@ -132,6 +184,12 @@ pub struct SendPipeline<'c> {
     /// 做精确差分修复（比 1.2 MB 整帧小一个数量级，交接延迟从 0.4–1 s 降到几十
     /// 毫秒）。运动期间发过整帧（迟到者/丢帧）时基线不再唯一，置 None 退回整帧。
     repair_baseline: Option<Frame>,
+    /// 本次平面 episode 开始时 `stats.motion_frames` 的读数。
+    ///
+    /// 退出时如果两数相等，说明这段期间**没有一帧有损 JPEG 落过观看端画布**（媒体通道自己
+    /// 在出画），那么"基线 ↔ 当前帧"的定点差集就是完备的；不相等说明画布被有损帧盖过，
+    /// 基线不可信，必须整帧重建（#56 的教训）。
+    plane_motion_start: u64,
     /// 图块通路的每秒预算 bps（0 = 不限制）。由调用方按真实链路统计设定：
     /// 无损更新已经装不下这条链路时，画面交给媒体通道而不是继续堆队列。
     budget_bps: u64,
@@ -168,9 +226,19 @@ pub struct SendPipeline<'c> {
     /// 传输层报告过脱落（`qdrop` / `stale` / 限速桶 `shed`），正在等下一次观看端报告的裁决：
     /// 报告指出缺口 → 既有逐块修复路径接手；报告说"全齐" → 盲区，升级补账。见 [`Self::on_report`]。
     loss_claimed: bool,
+    /// 脱落那批里**具体是哪些块**（发送任务丢的是哪个批次我们知道）。空 = 脱落信息没带
+    /// 块 id（外部只记了案），那种情况才需要走整帧兑现。见 `note_link_loss_tiles`。
+    loss_tiles: Vec<TileId>,
     /// 脱落要补账，这一帧要决定怎么补：
     /// 见 [`Self::note_link_loss`] 与差分段的取舍（#52）。
     loss_pending: bool,
+    /// 上一次**排上补账重建**的时刻（用报告的 `now_ms`，与它同一把钟）。`None` = 还没排过，
+    /// 会话第一次补账不该被冷却挡住。
+    ///
+    /// 必须按墙钟计，不能按"报告份数"计：观看端一发现链路空洞就会提前上报（早路），报告的
+    /// 疏密因此不再是常数。实测踩过一次——冷却写成"攒满 3 份报告"后，早报把 3 份压缩到
+    /// 0.45 s，反活锁被自己削掉，同一臂 `tile_bytes` 从 8.25 MB 涨到 16.33 MB、整帧 2→4。
+    rebuild_armed_ms: Option<u64>,
     /// 脱落要补账，但一次整帧重建塞不进预算 ⇒ 交给媒体平面，并由**预算**那条路记账。
     loss_needs_plane: bool,
     /// 链路可用上行的**原始**估计 bps（0 = 还不知道）。运动判定要问的不是
@@ -204,6 +272,10 @@ impl<'c> SendPipeline<'c> {
             state: SendState::new(first),
             codecs,
             scroll_enabled: true,
+            lossy_trial_floor: 512,
+            lossy_save_x: 2,
+            lossy_save_x_edgy: 3,
+            lossy_edges_min: 64,
             stats: SendStats::default(),
             seq: 0,
             frame_id: 0,
@@ -222,6 +294,7 @@ impl<'c> SendPipeline<'c> {
             video_mode: false,
             motion_seq: 0,
             repair_baseline: None,
+            plane_motion_start: 0,
             budget_bps: 0,
             win_ts: 0,
             win_bytes: 0,
@@ -237,7 +310,9 @@ impl<'c> SendPipeline<'c> {
             receiver_strain: false,
             plane_prev: None,
             loss_claimed: false,
+            loss_tiles: Vec::new(),
             loss_pending: false,
+            rebuild_armed_ms: None,
             loss_needs_plane: false,
             link_bps: 0,
             feed_fps: 0,
@@ -284,6 +359,19 @@ impl<'c> SendPipeline<'c> {
     /// 链路都白花一个整帧（实测 `full=2`，#53）。裁决见 [`Self::on_report`]。
     pub fn note_link_loss(&mut self) {
         self.loss_claimed = true;
+    }
+
+    /// 同上，但**带上丢掉的是哪些块**（发送任务丢的总是某个 Update 批次，块 id 是已知的）。
+    /// 有这份信息时，下一次报告的补账只补那些块，不兑现成整帧：实测 1080p 半屏单帧突变，
+    /// 一次 `stale=1` 先正确逐块补了 121 块，随后又被一份"全齐"的报告兑现成一次
+    /// 4.2 MB 整帧重建（同一份变化的总价 2.45→6.65 MB）。
+    pub fn note_link_loss_tiles(&mut self, ids: &[TileId]) {
+        self.loss_claimed = true;
+        for id in ids {
+            if !self.loss_tiles.contains(id) {
+                self.loss_tiles.push(*id);
+            }
+        }
     }
 
     /// 设预热上限（µs，0 = 关闭预热）。
@@ -653,7 +741,16 @@ impl<'c> SendPipeline<'c> {
                 // 退出判据**不**看 strain：能力信号只决定"要不要交出去"，决定"什么时候
                 // 收回来"的必须是画面本身是否静止——否则小字再也回不到无损（实测
                 // forced-plane 里平面再也退不出来，终帧逐字节不一致）。
-                if !self.budget_room(demand_now) || self.encode_pressure {
+                //
+                // 但**续期**必须看 strain：平面可以由 by_strain 单独举起（浏览器解码跟不上），
+                // 而续期只认 budget/encode_pressure 时，它会在 10 帧迟滞后用"新变化装得下"为理由
+                // 关掉，关完不到 1 s strain 再次达标又立刻举起——实测 720p+`ESS_DEMO_VIDEO`
+                // 配浏览器观看端 12 s 内进出 6 次（每次退出只撑一拍，无损画面被 960x540 反复顶掉），
+                // 而**同一内容配原生观看端 switches=0、全程 plane=false**：说明点平面的就是 strain，
+                // 抖动的来源就是"举起它的信号不参与维持它"。
+                // strain 自限：画面静止 → 无更新 → 两个 500 ms 报告内衰减 → 照样退回无损，
+                // 由 `settled_picture_returns_to_lossless_even_while_budget_stays_tight` 判真伪。
+                if !self.budget_room(demand_now) || self.encode_pressure || self.receiver_strain {
                     self.motion_hold = self.hold_frames;
                 }
             }
@@ -703,12 +800,17 @@ impl<'c> SendPipeline<'c> {
                 let leaving_video = self.video_plane && self.video_mode;
                 let baseline = self.repair_baseline.take();
                 match baseline {
-                    // 视频平面退出：画布没被有损帧碰过，只补真正的差集（可以为空 =
-                    // 画面已经回到运动前的样子，一个像素都不用发）
-                    Some(base) if leaving_video => {
+                    // 视频平面退出、且这段期间**一帧 JPEG 都没编出来**（媒体通道自己出画，
+                    // 观看端画布没被有损像素碰过）：基线仍然等于画布，只补真正的差集
+                    // （可以为空 = 画面已经回到运动前的样子，一个像素都不用发）。
+                    Some(base)
+                        if leaving_video
+                            && self.stats.motion_frames == self.plane_motion_start =>
+                    {
                         out.extend(self.emit_repair(&base, cur)?);
                     }
-                    // JPEG 运动通路：画布被有损帧盖过，必须整帧重建精确状态
+                    // JPEG 运动通路盖过画布，或根本不在媒体平面：基线不可信，
+                    // 必须整帧重建精确状态（#56）。
                     _ => {
                         out.push(self.emit_full(cur)?);
                     }
@@ -790,16 +892,21 @@ impl<'c> SendPipeline<'c> {
             self.plane_prev = Some(cur.clone());
             self.motion_active = true;
             self.motion_hold = self.hold_frames;
-            if by_budget {
-                // 差分修复的前提是"观看端画布 == 发送端 `last_sent`"。预算逼进平面时这个
-                // 前提恰好不成立：那些块正是无损通路自己发不动的（§6.6 压住的需求）。退出
-                // 时只补「基线 ↔ 当前帧」的差集就会漏掉它们——实测 motion 门禁在所有
-                // `forced_plane=1` 的运行里停在旧画布（落画 7910 / 期望 10307，#56）。
-                // 这种交接退出走整帧重建（既有 `_ => emit_full` 那条路，可靠通道）。
-                self.repair_baseline = None;
-            } else if self.repair_baseline.is_none() {
+            // 基线一律记住"进入这一刻，发送端认为观看端持有什么画面"。要不要退化成整帧
+            // 重建，改由退出时"这段期间有没有有损 JPEG 真的盖过画布"决定（见
+            // `plane_motion_start` 与下面的 `match baseline`），而不是由被哪条理由逼进来决定。
+            //
+            // 原来这里对 `by_budget` 直接 `repair_baseline = None`，理由是"那些块正是无损
+            // 通路自己发不动的，定点差集会漏掉它们（#56：motion 门禁里停在旧画布）"。那个
+            // 结论在 **JPEG 盖过画布** 的场合成立，但预算逼进来而画面全程由 H264 出画时，
+            // 观看端画布一动不动，`last_sent` 仍然等于画布，定点差集是完备的。补整帧的代价
+            // 实测很贵：1080p 照片类内容是 510 块 / ~3.5 MB，观看端要逐块盖好几秒——那正是
+            // 用户报的"很多个图块慢慢覆盖"（真机产品路径：`switches=4`、观看端 `fulls` 2→4，
+            // 而真正变化的 255 块从未以定点修复落地）。
+            if self.repair_baseline.is_none() {
                 self.repair_baseline = Some(self.state.last_sent.clone());
             }
+            self.plane_motion_start = self.stats.motion_frames;
             if by_budget {
                 self.stats.budget_forced += 1;
             } else if by_encode {
@@ -842,30 +949,31 @@ impl<'c> SendPipeline<'c> {
         let t_pack = std::time::Instant::now();
         // 整帧只有一个码流字段：选一个能编码全部块的编码器（整帧不常见，
         // 逐块回退不值得为它把整帧拆成多条消息）。
-        let mut chosen = None;
-        for c in self.codecs.codecs {
-            let mut payloads = Vec::with_capacity(n);
-            let mut ok = true;
-            for i in 0..n {
-                let id = TileId(i as u16);
-                let g = grid.geom(id, cur.w, cur.h);
-                let raw = extract_tile(cur, g);
-                match c.encode(&raw, g.w, g.h) {
-                    Ok(p) => payloads.push(p),
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                }
+        // 逐块按价选码（同一个 `encode_by_cost`，与差分批、报告重发走完全一样的规则）。
+        // 老版本这里"挑一个能编完所有块的编码器"，照片类桌面于是整帧只能走 PNG：实测
+        // 1080p 首帧 3.72 MB，逐块 1.67 MB（2.22×，459/510 块 JPEG）。
+        let mut payloads = Vec::with_capacity(n);
+        let mut codecs = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = TileId(i as u16);
+            let g = grid.geom(id, cur.w, cur.h);
+            let raw = extract_tile(cur, g);
+            let (cid, p) = self.codecs.encode_by_cost(
+                &raw,
+                g.w,
+                g.h,
+                self.lossy_trial_floor,
+                self.lossy_save_x,
+                self.lossy_save_x_edgy,
+                self.lossy_edges_min,
+            )?;
+            if matches!(cid, TileCodecId::Jpeg) {
+                self.stats.tiles_lossy += 1;
             }
-            if ok {
-                chosen = Some((c.id(), payloads));
-                break;
-            }
+            payloads.push(p);
+            codecs.push(cid);
         }
-        let Some((full_codec, payloads)) = chosen else {
-            return Err(CodecError::Unsupported);
-        };
+        let full_codec = codecs.first().copied().unwrap_or(TileCodecId::Png);
         self.stats.encode_us += t_pack.elapsed().as_micros() as u64;
         self.stats.bytes_encoded += payloads.iter().map(|p| p.len() as u64).sum::<u64>();
         self.frame_id += 1;
@@ -878,6 +986,7 @@ impl<'c> SendPipeline<'c> {
             w: cur.w,
             h: cur.h,
             codec: full_codec,
+            codecs,
             versions: self.ctl.version.clone(),
             epochs: self.ctl.epoch.clone(),
             payloads,
@@ -943,7 +1052,7 @@ impl<'c> SendPipeline<'c> {
         now_ms: u64,
     ) -> Result<Vec<WireMsg>, CodecError> {
         self.ctl.set_now(now_ms);
-        let tiles = self.ctl.on_report(layout_id, versions, epochs, now_ms);
+        let mut tiles = self.ctl.on_report(layout_id, versions, epochs, now_ms);
         // 报告本身就是观看端能力的证据：它落后多少，决定要不要继续把画面交给图块通路。
         // 只在**无损通路正在承载画面**时取样：平面期间本来就不发图块，观看端的版本
         // 当然停在原地——那是我们不让它跟，不是它跟不上。混在一起判定会让平面永远
@@ -957,8 +1066,51 @@ impl<'c> SendPipeline<'c> {
         // 而缺口仍在，那是"还没送到"，不是"看不见"。旧布局的报告由布局消息负责，不在这里升级。
         if self.loss_claimed && layout_id == self.ctl.layout_id {
             self.loss_claimed = false;
-            if self.ctl.last_gap == 0 {
-                self.loss_pending = true;
+            if self.loss_tiles.is_empty() {
+                // 脱落没带块 id（调用方只记了案）：报告说"全齐"而确实掉过东西，那就是产出时
+                // 提交版本把缺口掩盖了，逐块修复永远不会要这些块 ⇒ 补一次整帧。
+                //
+                // 补账排上的整帧走 baseline + 可靠通路：新鲜度闸门不丢它、SCTP 会重传它。所以排上
+                // 之后必须给它一次整帧的往返时间，否则每份"看不出缺口"的报告就要一次整帧重建——
+                // 实测（1080p 照片类半屏单帧突变）一张静止画面为了一次 2.3 MB 的变化累计发了
+                // **10 个整帧 = 36 MB**（加上这条冷却后是 2 个 / 8.25 MB），队列被顶到 3–5、
+                // 后续 108 个批次被判过时丢掉。锁死测试
+                // `link_loss_rebuilds_the_baseline_when_the_budget_can_carry_it` 钉的是"要补这一次
+                // 账"，没有钉"每半秒补一次"。
+                //
+                // 冷却按**报告时钟的墙钟**算（1500 ms ≈ 三个默认报告周期），不按报告份数算：
+                // 观看端一发现链路空洞就会提前上报（`view.rs` 与 `app.js` 里那条早路），"份数"
+                // 这把尺子会被早报压短——实测那样反而把重建从 2 次顶回 4 次、字节 8.25 → 16.33 MB。
+                let cooled = match self.rebuild_armed_ms {
+                    None => true,
+                    Some(t) => now_ms.saturating_sub(t) >= 1500,
+                };
+                if self.ctl.last_gap == 0 && cooled {
+                    self.loss_pending = true;
+                    self.rebuild_armed_ms = Some(now_ms);
+                }
+            } else {
+                // 知道掉了哪些块：报告已经要回去的那些正在逐块修复的路上，剩下的才是真欠的账
+                // ——按块补（受 §6.6 修复预算约束），不兑现成整帧。实测 1080p 半屏单帧突变：
+                // 一次 `stale=1` 先正确补了 121 块，随后又被一份"全齐"的报告兑现成 4.2 MB 整帧，
+                // 同一份变化的总价从 2.45 MB 涨到 6.65 MB。
+                let asked: Vec<TileId> = self.ctl.last_gap_ids.clone();
+                let owed: Vec<TileId> = std::mem::take(&mut self.loss_tiles)
+                    .into_iter()
+                    .filter(|id| !asked.contains(id))
+                    .collect();
+                if !owed.is_empty() {
+                    let back = self.ctl.resend_tiles(&owed, now_ms);
+                    let sent: Vec<TileId> = back.iter().map(|t| t.id).collect();
+                    // 被预算扣下的那部分不许悄悄销案：留到下一次报告，否则"我们知道掉了谁、
+                    // 却再也没补"正是 #52 那类静默画面错误。
+                    let still: Vec<TileId> = owed.into_iter().filter(|id| !sent.contains(id)).collect();
+                    if !still.is_empty() {
+                        self.loss_claimed = true;
+                        self.loss_tiles = still;
+                    }
+                    tiles.extend(back);
+                }
             }
         }
         if tiles.is_empty() {
@@ -971,6 +1123,10 @@ impl<'c> SendPipeline<'c> {
             tiles,
         };
         let frame = self.state.last_sent.clone();
+        // 这里仍然走 lossy，不是疏忽：把"承认的缺口"改挂可靠通路实测**更差**（照片素材同一臂
+        // 单轮：`report_resends` 2409→2707、`tile_bytes` 11.55→12.81 MB、闸门丢掉 26→31）。
+        // 可靠是有序且队头阻塞的——一份修复压在前面，其后几帧的新内容反而被判过时丢掉，
+        // 于是又要更多修复。要治的是那批字节本身，不是这条通道的顺序。
         Ok(vec![self.wire_update(msg, &frame, false)?])
     }
 
@@ -983,7 +1139,18 @@ impl<'c> SendPipeline<'c> {
         for t in tiles {
             let g = self.grid.geom(t.id, cur.w, cur.h);
             let raw = extract_tile(cur, g);
-            let (codec_id, payload) = self.codecs.encode(&raw, g.w, g.h)?;
+            let (codec_id, payload) = self.codecs.encode_by_cost(
+                &raw,
+                g.w,
+                g.h,
+                self.lossy_trial_floor,
+                self.lossy_save_x,
+                self.lossy_save_x_edgy,
+                self.lossy_edges_min,
+            )?;
+            if matches!(codec_id, TileCodecId::Jpeg) {
+                self.stats.tiles_lossy += 1;
+            }
             self.stats.bytes_encoded += payload.len() as u64;
             wt.push(WireTile {
                 id: t.id,
@@ -1029,6 +1196,13 @@ pub struct RecvPipeline<'c> {
     /// 不再贴画布——否则低清帧会盖在视频上面，退出时又闪一下。
     pub accept_video_plane: bool,
     video_mode: bool,
+    /// 自渲染端取走以来，画布被写过的最小矩形（像素坐标）。
+    ///
+    /// 观看端的上传代价按**变化面积**算，不是按帧大小算：1080p 下一次单块更新
+    /// 不该付整幅逐像素 BGRA→RGBA 交换 + 整幅 putImageData 的价钱。那个价钱实测
+    /// 会把解码占用顶过闸门（44 % → shed 开），大面积更新被观看端自己丢掉，
+    /// 表现就是"很多个图块慢慢覆盖"。
+    dirty: Option<TileGeom>,
 }
 
 impl<'c> RecvPipeline<'c> {
@@ -1049,6 +1223,7 @@ impl<'c> RecvPipeline<'c> {
             full_layout: 0,
             accept_video_plane: false,
             video_mode: false,
+            dirty: None,
         }
     }
 
@@ -1094,6 +1269,7 @@ impl<'c> RecvPipeline<'c> {
                         *rows as u32 * crate::TILE,
                         0,
                     );
+                    self.mark_dirty_all();
                     self.pending.clear();
                     self.grouped_raw.clear();
                 }
@@ -1146,6 +1322,7 @@ impl<'c> RecvPipeline<'c> {
                 } else if self.canvas.w > 0 {
                     crate::motion::decode_into_canvas(data, &mut self.canvas)
                         .map_err(|_| CodecError::Corrupt("motion jpeg"))?;
+                    self.mark_dirty_all();
                     // 有损帧不更新逐块版本。发送端在退出运动时会补一帧无损；
                     // 这里不把布局标记为“缺整帧”，否则运动期间每份报告都会
                     // 触发补帧（实测退化成每秒一帧大整帧的抖动）。
@@ -1155,11 +1332,12 @@ impl<'c> RecvPipeline<'c> {
             WireMsg::VideoMode { on, .. } => {
                 self.video_mode = *on;
             }
-            WireMsg::Full { layout_id, w, h, codec, versions, epochs, payloads, .. } => {
+            WireMsg::Full { layout_id, w, h, codec, codecs, versions, epochs, payloads, .. } => {
                 self.layout_id = *layout_id;
                 let grid = TileGrid::for_frame(*w, *h);
                 self.grid = grid;
                 self.canvas = Frame::new(*w, *h, 0);
+                self.mark_dirty_all();
                 let mut contents = Vec::with_capacity(payloads.len());
                 let n = grid.tile_count().min(payloads.len());
                 for i in 0..n {
@@ -1167,7 +1345,7 @@ impl<'c> RecvPipeline<'c> {
                     let g = grid.geom(id, *w, *h);
                     let t = WireTile {
                         id,
-                        codec: *codec,
+                        codec: codecs.get(i).copied().unwrap_or(*codec),
                         x: g.x,
                         y: g.y,
                         w: g.w,
@@ -1213,6 +1391,59 @@ impl<'c> RecvPipeline<'c> {
         }
         let g = self.grid.geom(id, self.canvas.w, self.canvas.h);
         blit_geom(&mut self.canvas, g, raw);
+        self.mark_dirty(g);
+    }
+
+    /// 记下画布上被写过的一块（越界部分裁掉，坐标始终落在 canvas.w×canvas.h 里）。
+    fn mark_dirty(&mut self, g: TileGeom) {
+        if self.canvas.w == 0 || g.w == 0 || g.h == 0 {
+            return;
+        }
+        let x = g.x.min(self.canvas.w);
+        let y = g.y.min(self.canvas.h);
+        let right = (g.x + g.w).min(self.canvas.w);
+        let bottom = (g.y + g.h).min(self.canvas.h);
+        if right <= x || bottom <= y {
+            return;
+        }
+        let g = TileGeom { x, y, w: right - x, h: bottom - y };
+        self.dirty = Some(match self.dirty {
+            Some(d) => {
+                let x0 = d.x.min(g.x);
+                let y0 = d.y.min(g.y);
+                TileGeom {
+                    x: x0,
+                    y: y0,
+                    w: (d.x + d.w).max(g.x + g.w) - x0,
+                    h: (d.y + d.h).max(g.y + g.h) - y0,
+                }
+            }
+            None => g,
+        });
+    }
+
+    /// 整个画布都要重传（尺寸变化、有损帧、平移：每一行都换内容）。
+    fn mark_dirty_all(&mut self) {
+        self.mark_dirty(TileGeom { x: 0, y: 0, w: self.canvas.w, h: self.canvas.h });
+    }
+
+    /// 渲染端取走脏矩形并清空。`None` = 自上次上屏以来像素没变。
+    pub fn take_dirty(&mut self) -> Option<TileGeom> {
+        self.dirty.take()
+    }
+
+    /// 观看端的周期时钟。**必须定期调用**（现场节奏 = 报告周期 ~500 ms），不调用就有永久错画面：
+    /// 滚动组等不齐时画布不平移，而报告要回来的块会被重新塞进组缓冲（版本却记成最新），
+    /// 于是"零丢包、版本对得上、整条块行是旧的"。机制与实测数字见 `Receiver::tick` 的注释。
+    ///
+    /// 这里只把模型侧判定的组落屏（平移 + 已到条带块上屏），返回仍缺的块数；
+    /// 缺的那些块版本仍落在发送端后面，下一份报告自己会把它们按块要回来。
+    pub fn tick(&mut self, now_ms: u64) -> usize {
+        // 比默认报告周期（~500 ms）略短：超时要落在"下一份报告还来得及救"的那一侧。
+        const SCROLL_GROUP_TIMEOUT_MS: u64 = 400;
+        let need = self.rx.tick(now_ms, SCROLL_GROUP_TIMEOUT_MS);
+        self.drain_completed_scrolls();
+        need.len()
     }
 
     fn group_of(&self, id: TileId, epoch: u32) -> Option<u32> {
@@ -1227,6 +1458,8 @@ impl<'c> RecvPipeline<'c> {
         for (sid, dy) in self.rx.take_completed_scrolls() {
             if dy != 0 {
                 apply_vscroll(&mut self.canvas.px, self.canvas.stride, self.canvas.h, dy);
+                // 平移后每一行都是别处的内容，整幅都得重传
+                self.mark_dirty_all();
             }
             if let Some((_, dirty)) = self.pending.remove(&sid) {
                 for id in dirty {
@@ -1272,4 +1505,28 @@ pub fn sub16_geoms(grid: &TileGrid, parent: TileId, frame_w: u32, frame_h: u32) 
         y += SUBTILE;
     }
     out
+}
+
+/// 满量程跳变计数：相邻像素亮度差 >128 的次数（横 + 纵）。
+/// 为什么用这条可算的量：字与细线是"一跳到头、成对出现"，而渐变/噪声是"跳得频繁但幅度小"。
+/// 实测（`crates/ess-codec-palette/tests/codec_cost.rs`）：照片块 0、照片上压字 462、
+/// 平涂文本 192..544 —— 用它把"糊了会心疼"的块挡在有损门外，只花一次 4096 px 扫描。
+fn full_scale_edges(raw: &[u8], w: u32, h: u32) -> usize {
+    let (w, h) = (w as usize, h as usize);
+    let lum = |i: usize| -> u32 {
+        (raw[i] as u32 * 19595 + raw[i + 1] as u32 * 38470 + raw[i + 2] as u32 * 7471) >> 16
+    };
+    let mut hits = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            if x + 1 < w && lum(i).abs_diff(lum(i + 4)) > 128 {
+                hits += 1;
+            }
+            if y + 1 < h && lum(i).abs_diff(lum(i + w * 4)) > 128 {
+                hits += 1;
+            }
+        }
+    }
+    hits
 }

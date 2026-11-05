@@ -306,24 +306,48 @@ impl Receiver {
         std::mem::take(&mut self.completed_scrolls)
     }
 
-    /// 周期时钟：迟迟不齐的组请求重同步。**组不解散**（解散后迟到的块会
-    /// 零散应用，回到撕裂）。返回需要重同步的块集合。
+    /// 周期时钟：迟迟不齐的组**带着缺口完成**（先平移、已到块上屏），返回还缺的条带块。
+    ///
+    /// 原来这条只记账、不解散（怕"解散后迟到的块零散应用 ⇒ 撕裂"），而生产代码从来没调用它，
+    /// 于是"宣告到了、条带没到"是一个**永久错画面**：组不完成 ⇒ 画布不平移；报告重发回来的块
+    /// 又被 `group_of` 重新塞进组缓冲、等一个永不到来的组齐 ⇒ 像素没上屏、版本却记成最新，
+    /// 下一份报告看不出缺口。实测（`crates/ess-codec-palette/tests/recovery.rs` 条带臂）：
+    /// 一次条带丢失后 180 块重发全被吞，60 块的版本与 epoch 双方一致而内容是旧的。
+    ///
+    /// 现在把"完成"与"齐"解绑：平移是整组共同的账，先做；缺的那些块**版本仍落在发送端后面**
+    /// （它们从没应用过），下一份报告按块把它们要回来，那时组已不存在 ⇒ 走普通块路径直接上屏。
+    /// 撕裂的担心不成立：迟到的条带块补的正是平移之后该重画的那一条带。
     pub fn tick(&mut self, now_ms: u64, group_timeout_ms: u64) -> Vec<TileId> {
         self.now_hint = now_ms;
         let mut need = Vec::new();
         let sids: Vec<u32> = self.groups.keys().copied().collect();
         for sid in sids {
-            let g = self.groups.get_mut(&sid).unwrap();
-            let stale = now_ms.saturating_sub(g.registered_at) > group_timeout_ms;
-            if stale && !g.resync_requested {
-                g.resync_requested = true;
-                self.stats.group_resyncs += 1;
-                for id in g.dirty.iter() {
-                    if !g.arrived.contains_key(id) {
-                        need.push(*id);
-                    }
+            let expired = {
+                let g = self.groups.get_mut(&sid).unwrap();
+                // 组的起点取自**上一次时钟**的刻度（`registered_at = now_hint`），所以第一份时钟只做
+                // 校准：登记在 0（本会话还没 tick 过）的组此刻并不知道自己已经活了多久，直接判死会让
+                // 每个观看端一连上就白花一次重取。
+                if g.registered_at == 0 {
+                    g.registered_at = now_ms;
                 }
+                !g.resync_requested && now_ms.saturating_sub(g.registered_at) > group_timeout_ms
+            };
+            if !expired {
+                continue;
             }
+            let (dy, missing) = {
+                let g = self.groups.get_mut(&sid).unwrap();
+                g.resync_requested = true;
+                let missing: Vec<TileId> =
+                    g.dirty.iter().filter(|id| !g.arrived.contains_key(id)).copied().collect();
+                (g.dy, missing)
+            };
+            // 组从这一刻不再存在：`group_of` 认不到它，之后的修复块按普通块上屏。
+            self.groups.remove(&sid);
+            self.applied_scrolls.insert(sid);
+            self.completed_scrolls.push((sid, dy));
+            self.stats.group_resyncs += 1;
+            need.extend(missing);
         }
         need
     }

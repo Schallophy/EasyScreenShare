@@ -61,6 +61,10 @@ pub struct Sender {
     /// 脱落补账要靠它分辨"观看端说要不到"和"观看端说全都齐了但像素是旧的"，
     /// 见 `SendPipeline::on_report`（#52 / #53）。
     pub last_gap: usize,
+    /// `last_gap` 那份缺口的**块 id**（预算截断之前）。脱落补账要靠它把「报告已经要回去的块」
+    /// 与「报告没要、但我们自己丢掉的块」分开：前者逐块修复已经在送，后者才需要补，
+    /// 而且补的应该是那些块本身，不是整帧。见 `SendPipeline::on_report`。
+    pub last_gap_ids: Vec<TileId>,
     /// 连续"大面积落后"的报告次数（能力判据，见 `receiver_strain`）
     pub strain_run: u32,
     /// 是否**见过一次**完全跟上的报告。能力判据比的是"本来跟得上，现在跟不上了"，
@@ -109,6 +113,7 @@ impl Sender {
             last_report_tiles: 0,
             last_behind: 0,
             last_gap: 0,
+            last_gap_ids: Vec::new(),
             strain_run: 0,
             ever_current: false,
             pending_layout: None,
@@ -352,6 +357,7 @@ impl Sender {
             self.last_report_tiles = n;
             self.last_behind = behind;
             self.last_gap = ids.len();
+            self.last_gap_ids = ids.clone();
             out = self.resend(&ids, now_ms);
             // 能力证据只在"要发的都发出去了"时才计数：预算把差集截断过，观看端的落后
             // 就是我们没发，不是它啃不动（实测 forced-plane 里这种落后抢在预算执行器

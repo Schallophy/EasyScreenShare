@@ -57,6 +57,8 @@ pub struct Viewer {
     full_msgs: u32,
     scroll_msgs: u32,
     state_msgs: u32,
+    /// 发送端消息序列的空洞数：lossy 丢掉的更新在这里才看得见
+    seqg: ess_core::wire::SeqGaps,
 }
 
 impl Viewer {
@@ -66,6 +68,8 @@ impl Viewer {
             vec![
                 Box::leak(Box::new(PaletteZstdCodec::default())) as &'static dyn TileCodec,
                 Box::leak(Box::new(PngCodec)) as &'static dyn TileCodec,
+                // 有损图块（照片类才用）——wasm 侧的 JPEG 解码零件与 Motion 兜底帧同源
+                Box::leak(Box::new(ess_core::codec::JpegCodec::default())) as &'static dyn TileCodec,
             ]
             .into_boxed_slice(),
         );
@@ -81,6 +85,7 @@ impl Viewer {
             full_msgs: 0,
             scroll_msgs: 0,
             state_msgs: 0,
+            seqg: ess_core::wire::SeqGaps::default(),
         }
     }
 
@@ -118,6 +123,10 @@ impl Viewer {
             WireMsg::State { .. } => self.state_msgs += 1,
             _ => {}
         }
+        // 空洞检测：只有占号的才算（分片重组完才到这里，所以一帧多片只数一次）
+        if let Some(s) = msg.seq() {
+            self.seqg.note(s);
+        }
         let before = self.progress();
         match self.recv.on_wire(&msg) {
             Ok(()) => {
@@ -134,7 +143,10 @@ impl Viewer {
         }
     }
 
-    fn report(&self, out: &mut [u8]) -> i32 {
+    fn report(&mut self, out: &mut [u8], now_ms: u64) -> i32 {
+        // 先叫周期时钟：等不齐的滚动组必须判死，否则报告要回来的块会被组缓冲重新吞掉，
+        // 画面停在"版本对、内容旧"（机制与实测见 `RecvPipeline::tick`）。
+        self.recv.tick(now_ms);
         let Message::Report { layout_id, versions, epochs } = self.recv.report() else {
             return -1;
         };
@@ -240,6 +252,30 @@ pub unsafe extern "C" fn ess_viewer_serial(p: *const Viewer) -> u32 {
     (*p).serial
 }
 
+/// 自上次取走以来画布被写过的矩形，写入 `[x, y, w, h]`；返回 1 有、0 没有（取走即清空）。
+///
+/// 渲染端只交换、只上传这一块。整幅 1080p 的逐像素 BGRA→RGBA + `putImageData`
+/// 是按帧大小付钱，实测会把解码占用顶过观看端的 shed 闸门，大面积更新反而被
+/// 本机丢掉。
+///
+/// # Safety
+/// `p` 有效；`out` 指向至少 4 个可写 u32。
+#[no_mangle]
+pub unsafe extern "C" fn ess_viewer_dirty(p: *mut Viewer, out: *mut u32) -> u32 {
+    if p.is_null() || out.is_null() {
+        return 0;
+    }
+    let v = &mut *p;
+    match v.recv.take_dirty() {
+        Some(g) => {
+            let vals = [g.x, g.y, g.w, g.h];
+            std::ptr::copy_nonoverlapping(vals.as_ptr(), out, 4);
+            1
+        }
+        None => 0,
+    }
+}
+
 /// 当前画面由哪个平面出：1 = 视频轨（`<video>`），0 = 图块画布。
 ///
 /// # Safety
@@ -295,6 +331,7 @@ pub unsafe extern "C" fn ess_viewer_diag(p: *const Viewer, out: *mut u32, cap: u
         v.recv.full_layout(),
         v.recv.video_mode() as u32,
         v.recv.stats.motion_skipped as u32,
+        v.seqg.gaps as u32,
     ];
     let n = vals.len().min(cap);
     std::ptr::copy_nonoverlapping(vals.as_ptr(), out, n);
@@ -306,11 +343,16 @@ pub unsafe extern "C" fn ess_viewer_diag(p: *const Viewer, out: *mut u32, cap: u
 /// # Safety
 /// `p` 有效；`out`/`cap` 指向可写内存。
 #[no_mangle]
-pub unsafe extern "C" fn ess_viewer_report(p: *const Viewer, out: *mut u8, cap: usize) -> i32 {
+pub unsafe extern "C" fn ess_viewer_report(
+    p: *mut Viewer,
+    out: *mut u8,
+    cap: usize,
+    now_ms: u64,
+) -> i32 {
     if p.is_null() || out.is_null() || cap == 0 {
         return -1;
     }
-    let v = &*p;
+    let v = &mut *p;
     let buf = std::slice::from_raw_parts_mut(out, cap);
-    v.report(buf)
+    v.report(buf, now_ms)
 }

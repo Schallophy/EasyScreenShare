@@ -174,7 +174,9 @@ async fn main() {
 
     let pal = PaletteZstdCodec::default();
     let png = PngCodec;
-    let codecs = CodecSet { codecs: &[&pal, &png] };
+    // JPEG 放最后：选码器先试无损链，只有"省够 3 倍"才降级（见 `CodecSet::encode_by_cost`）。
+    let jpeg = ess_core::codec::JpegCodec::default();
+    let codecs = CodecSet { codecs: &[&pal, &png, &jpeg] };
     let mut recv = RecvPipeline::new(codecs);
     let mut asm = ess_transport::Assembler::default();
 
@@ -263,6 +265,12 @@ async fn main() {
 
     let t0 = Instant::now();
     let mut last_report = Instant::now();
+    // 发送端序列空洞：lossy 通路丢掉的那批更新在这里才看得见（与周期报告一起构成
+    // "发现缺口 → 立刻上报"的那条早路）
+    let mut seqg = ess_core::wire::SeqGaps::default();
+    let mut gaps_reported = 0u64;
+    // 因"看见新空洞"而提前上报的次数（早路真的动作过没有，只有这个数能证明）
+    let mut early_reports = 0u64;
     let mut last_secs = 0u64;
     let audio_stat: Arc<Mutex<AudioStat>> = Arc::new(Mutex::new(AudioStat::default()));
     let audio_pcm: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
@@ -292,6 +300,12 @@ async fn main() {
                                 plane_on.store(*on, Ordering::Relaxed);
                             }
                             inbox_peak = inbox_peak.max(events.len());
+                            // 序列记账必须在**脱落判定之前**：本机主动丢掉的 seq 我们也看见了，
+                            // 它不该被算成链路空洞再去要回来（那正好把新鲜度闸门想省的东西又要
+                            // 一遍，等于自造补账循环）。
+                            if let Some(s) = msg.seq() {
+                                seqg.note(s);
+                            }
                             if events.len() > backlog_keep && duty > duty_max && !is_baseline_msg(&msg)
                             {
                                 view_skip += 1;
@@ -521,9 +535,22 @@ async fn main() {
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
 
-        // 周期报告（§6.4 兜底）：让发送端重发丢失块
-        if last_report.elapsed() >= Duration::from_millis(500) {
+        // 周期报告（§6.4 兜底）：让发送端重发丢失块。
+        //
+        // 新看见一个链路空洞就立刻上报，不等下一个 500 ms 刻度：实测半屏照片类突变（255 块 /
+        // 2.3 MB）约四分之三当秒就到齐，剩下那一截纯粹在等这份报告的往返——报告是几 KB 的上行
+        // 可靠消息，早发不占下行带宽，也不动新鲜度判定（要回来的仍是发送端按**当前**画面算出的差集）。
+        let periodic = last_report.elapsed() >= Duration::from_millis(500);
+        if periodic || seqg.gaps > gaps_reported {
+            if !periodic {
+                early_reports += 1;
+            }
             last_report = Instant::now();
+            gaps_reported = seqg.gaps;
+            // 周期时钟：等不齐的滚动组必须由它判死。不调用 ⇒ 画布不平移、报告要回来的块被组缓冲
+            // 重新吞掉、版本却记成最新，现场读起来就是"零丢包、版本对、整条块行是旧的"。
+            // 见 `RecvPipeline::tick`（机制与实测）与 `crates/ess-codec-palette/tests/recovery.rs`。
+            recv.tick(t0.elapsed().as_millis() as u64);
             if let Message::Report { layout_id, versions, epochs } = recv.report() {
                 let state = WireMsg::State {
                     layout_id,
@@ -598,12 +625,14 @@ async fn main() {
             secs_last = s1;
             let applied = recv.stats.applied_tiles;
             println!(
-                "VIEW-STATS t={s1}s inbox_peak={} skip={} duty={:.2} applied={} tile_rate={}",
+                "VIEW-STATS t={s1}s inbox_peak={} skip={} duty={:.2} applied={} tile_rate={} gaps={} early={}",
                 inbox_peak,
                 view_skip - skip_last,
                 duty,
                 applied,
-                applied - applied_last
+                applied - applied_last,
+                seqg.gaps,
+                early_reports
             );
             inbox_peak = 0;
             skip_last = view_skip;

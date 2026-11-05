@@ -10,6 +10,7 @@ pub enum TileCodecId {
     PaletteZstd,
     Png,
     Raw,
+    Jpeg,
 }
 
 #[derive(Debug)]
@@ -44,6 +45,11 @@ pub trait TileCodec: Send + Sync {
     /// `dst` 至少 `stride * h` 字节；`stride >= w * 4`。
     fn decode_into(&self, data: &[u8], dst: &mut [u8], stride: u32) -> Result<(), CodecError>;
     fn id(&self) -> TileCodecId;
+    /// 有损编码返回 true。选码器只在它**明显更便宜**时才选中它，见
+    /// `crate::pipeline::CodecSet::encode_by_cost`。
+    fn lossy(&self) -> bool {
+        false
+    }
 }
 
 /// 原样存储（BGRA 紧排）。仅用于测试与兜底：体积就是 `w*h*4`。
@@ -75,5 +81,79 @@ impl TileCodec for RawCodec {
 
     fn id(&self) -> TileCodecId {
         TileCodecId::Raw
+    }
+}
+
+/// 有损图块编码：全采样 4:4:4，**不做色度下采样**——下采样糊掉的正是字与细线，
+/// 而"糊"是这条路线只肯付给照片、不肯付给文字的东西。
+///
+/// 为什么必须有它（实测，`crates/ess-codec-palette/tests/codec_cost.rs`，64×64 一块）：
+/// 照片类一块 PNG 中位 5 563 B、JPEG(q80) 中位 1 210 B ⇒ **省 4.6×**；一次 1080p 半屏
+/// 照片类变化 = 255 块 = 2.29 MB，按实测出口 3.5–5 MB/s 要 0.45–0.65 s 才铺完，走这里
+/// 进 0.1 s 档。而同一张表里"照片背景上压字"只省 2.5×、平涂文本块调色板中位 **102 B**
+/// （比 JPEG 还小 12 倍）——所以**判据是省几倍，不是内容像什么**：省不到门限就留无损。
+pub struct JpegCodec {
+    pub quality: u8,
+}
+
+impl Default for JpegCodec {
+    fn default() -> Self {
+        Self { quality: 80 }
+    }
+}
+
+impl TileCodec for JpegCodec {
+    fn encode(&self, raw: &[u8], w: u32, h: u32) -> Result<Vec<u8>, CodecError> {
+        let n = w as usize * h as usize;
+        if raw.len() < n * 4 {
+            return Err(CodecError::BadGeometry);
+        }
+        // BGRA → RGB 紧排（`motion::encode_rgb` 收 RGB，且 4:4:4 不分采样）
+        let mut rgb = vec![0u8; n * 3];
+        for i in 0..n {
+            rgb[i * 3] = raw[i * 4 + 2];
+            rgb[i * 3 + 1] = raw[i * 4 + 1];
+            rgb[i * 3 + 2] = raw[i * 4];
+        }
+        crate::motion::encode_rgb(&rgb, w, h, self.quality).map_err(CodecError::Backend)
+    }
+
+    fn decode_into(&self, data: &[u8], dst: &mut [u8], stride: u32) -> Result<(), CodecError> {
+        let mut dec = zune_jpeg::JpegDecoder::new(data);
+        let rgb = dec.decode().map_err(|e| CodecError::Backend(format!("jpeg: {e:?}")))?;
+        let info = dec.info().ok_or(CodecError::Corrupt("jpeg missing info"))?;
+        let iw = usize::from(info.width);
+        let ih = usize::from(info.height);
+        if iw == 0 || ih == 0 {
+            return Err(CodecError::Corrupt("jpeg empty"));
+        }
+        let ch = (rgb.len() / (iw * ih)).max(1);
+        if ch < 3 {
+            return Err(CodecError::Corrupt("jpeg is not color"));
+        }
+        let st = stride as usize;
+        if dst.len() < ih * st {
+            return Err(CodecError::BadDst);
+        }
+        for y in 0..ih {
+            let d = y * st;
+            for x in 0..iw {
+                let si = (y * iw + x) * ch;
+                let di = d + x * 4;
+                dst[di] = rgb[si + 2];
+                dst[di + 1] = rgb[si + 1];
+                dst[di + 2] = rgb[si];
+                dst[di + 3] = 255;
+            }
+        }
+        Ok(())
+    }
+
+    fn id(&self) -> TileCodecId {
+        TileCodecId::Jpeg
+    }
+
+    fn lossy(&self) -> bool {
+        true
     }
 }

@@ -80,7 +80,14 @@ const out = await evalIn(`(async () => {
   if (!window.__ess) return JSON.stringify({ err: '__ess 不存在（wasm 没加载？）' });
   const snap = () => {
     const s = window.__ess.shed();
+    // wasm 侧计数器（diag 槽）：[0]=重组完成过的分片 [1]=落画成功 [6]=收到的 Update 消息。
+    // 用来分辨「大的不可靠突发根本没到浏览器」和「到了但没落画布」——这两种在
+    // 发送端读数上长得一模一样（画布代数冻结 + missing 不刷新）。
+    const d = (window.__ess.diag && window.__ess.diag()) || [];
     return {
+      ch: d[0] || 0,
+      ok: d[1] || 0,
+      upd: d[6] || 0,
       t: Math.round(performance.now() / 1000),
       msgs: window.__ess.state.msgs,
       serial: window.__ess.state.serial,

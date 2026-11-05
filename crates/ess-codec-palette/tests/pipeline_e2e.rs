@@ -5,7 +5,7 @@
 
 use ess_codec_palette::PaletteZstdCodec;
 use ess_codec_png::PngCodec;
-use ess_core::frame::Frame;
+use ess_core::frame::{Frame, TileGeom};
 use ess_core::pipeline::{CodecSet, RecvPipeline, SendPipeline};
 use ess_core::wire::{self, WireMsg};
 use ess_core::SUBTILE;
@@ -231,4 +231,97 @@ fn e2e_truecolor_tile_falls_back_to_png() {
     assert!(saw_png, "truecolor tile should use PNG fallback");
     feed(&mut recv, msgs);
     assert_frame_eq(&recv.canvas, &frame, "truecolor tile");
+}
+
+/// 观看端只做一件事：把脏矩形从管线画布抄到自己的画布上。
+fn upload_rect(dst: &mut Frame, src: &Frame, g: &TileGeom) {
+    let n = g.w as usize * 4;
+    for y in g.y..(g.y + g.h).min(dst.h) {
+        let s = y as usize * src.stride + g.x as usize * 4;
+        let d = y as usize * dst.stride + g.x as usize * 4;
+        dst.px[d..d + n].copy_from_slice(&src.px[s..s + n]);
+    }
+}
+
+/// 抄完必须和真画布逐字节一致：脏矩形少一块像素，这里就红。
+fn upload_and_verify(recv: &mut RecvPipeline<'_>, sim: &mut Frame, label: &str) -> TileGeom {
+    let resized = sim.w != recv.canvas.w || sim.h != recv.canvas.h;
+    if resized {
+        *sim = Frame::new(recv.canvas.w, recv.canvas.h, 0);
+    }
+    let g = recv.take_dirty().unwrap_or_else(|| panic!("{label}: 像素变了却没给出脏矩形"));
+    if resized {
+        assert_eq!(
+            (g.x, g.y, g.w, g.h),
+            (0, 0, sim.w, sim.h),
+            "{label}: 画布尺寸变了，img 里其它位置是空的，必须整幅上传"
+        );
+    }
+    upload_rect(sim, &recv.canvas, &g);
+    assert_frame_eq(sim, &recv.canvas, label);
+    g
+}
+
+/// 脏矩形必须是"变化面积"而不是"帧大小"，而且**一块都不能少**。
+///
+/// 少的后果不是这一帧不准，而是永久不准：漏掉的那个像素要等下一次整帧才被纠正，
+/// 表现正是用户报的"很多个图块慢慢覆盖"。
+#[test]
+fn e2e_dirty_box_is_the_changed_area_and_covers_every_change() {
+    let pal = PaletteZstdCodec::default();
+    let png = PngCodec;
+    let codecs = CodecSet { codecs: &[&pal, &png] };
+    let mut frame = text_page(640, 480, 0, 3);
+    let mut send = SendPipeline::new(frame.clone(), codecs);
+    send.motion_enabled = false;
+    let mut recv = RecvPipeline::new(codecs);
+    let mut sim = Frame::new(0, 0, 0);
+
+    // 1) 整帧：画布刚建立，整幅上传
+    feed(&mut recv, send.on_frame(&frame).unwrap());
+    upload_and_verify(&mut recv, &mut sim, "full frame");
+    assert_eq!(recv.take_dirty(), None, "取走即清空：没有新像素就不该再上传");
+
+    // 2) 一处单块编辑：上传面积只该是那一块
+    paint_rect(&mut frame, 130, 200, 20, 10, 0xffff_0000);
+    feed(&mut recv, send.on_frame(&frame).unwrap());
+    let g = upload_and_verify(&mut recv, &mut sim, "single tile edit");
+    assert!(
+        (g.w as u64 * g.h as u64) * 8 <= sim.w as u64 * sim.h as u64,
+        "一处单块编辑却要上传 {}x{}（整幅 {}x{}）：脏矩形没起作用",
+        g.w, g.h, sim.w, sim.h
+    );
+
+    // 3) 同帧两块分离的编辑：外接矩形，两张画布仍然一致
+    paint_rect(&mut frame, 2, 2, 8, 8, 0xff00_ff00);
+    paint_rect(&mut frame, 500, 400, 8, 8, 0xff00_00ff);
+    feed(&mut recv, send.on_frame(&frame).unwrap());
+    upload_and_verify(&mut recv, &mut sim, "two distant tiles");
+
+    // 4) 滚动：平移之后每一行都是别处的内容，整幅都得重传
+    let fresh = text_page(640, 480, 11, 23);
+    scroll_frame(&mut frame, 37, &fresh);
+    let scrolls = recv.stats.scrolls_applied;
+    feed(&mut recv, send.on_frame(&frame).unwrap());
+    if recv.stats.scrolls_applied > scrolls {
+        let g = recv.take_dirty().expect("滚动必须交出脏矩形");
+        assert_eq!(
+            (g.x, g.y, g.w, g.h),
+            (0, 0, sim.w, sim.h),
+            "平移后整幅都得重传"
+        );
+        upload_rect(&mut sim, &recv.canvas, &g);
+    }
+    assert_frame_eq(&sim, &recv.canvas, "after scroll");
+
+    // 5) 分辨率变化：画布重建，脏区必须整幅（sim 外圈还留着上一代的内容）
+    let mut frame2 = text_page(800, 600, 5, 55);
+    paint_rect(&mut frame2, 400, 300, 64, 64, 0xff00_00ff);
+    feed(&mut recv, send.on_frame(&frame2).unwrap());
+    upload_and_verify(&mut recv, &mut sim, "layout change");
+
+    // 6) 新画布上的单块编辑
+    paint_rect(&mut frame2, 700, 520, 40, 40, 0xffff_ff00);
+    feed(&mut recv, send.on_frame(&frame2).unwrap());
+    upload_and_verify(&mut recv, &mut sim, "edit on new canvas");
 }

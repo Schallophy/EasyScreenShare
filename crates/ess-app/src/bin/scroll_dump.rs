@@ -48,6 +48,7 @@ fn main() {
         // 要测"纯滚动内容"请走 `ess-share --demo` + `ESS_DEMO_BLOCK=0`。
         block: true,
         video_like: false,
+        step_at: 0,
     };
     let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout());
     for i in 0..frames {
