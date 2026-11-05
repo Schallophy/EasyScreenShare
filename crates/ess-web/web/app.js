@@ -45,6 +45,16 @@ let videoOn = false;    // 发送端宣告：现在由视频轨出画
 let vTrack = null;      // 已订阅的视频轨
 let videoArmed = true;  // 视频轨已交出 on 之后的新画面（未 armed 就继续显示画布）
 let vArmedBase = 0;     // on 到达时的累计解码帧数
+// 图块平面挂久了就**退订**视频轨。发送端图块平面下仍按 ~2 fps 喂编码器（保活，让
+// 切进视频平面时画面是当前的），但那几帧在浏览器里会被真的收下来、解码、再丢掉——
+// 原生观看端有 `VideoMode` 闸门，浏览器没有。实测图块平面下 inbound-rtp 视频仍有
+// 1440x808@2fps。所以：`plane=tiles` 持续 10 s 就把订阅摘掉，进入平面时再挂上
+// （代价是一次关键帧，和发送端停喂的代价是同一笔）。
+const UNSUB_AFTER_MS = 10000;
+let videoPub = null;    // 视频轨的 RemoteTrackPublication（退订/复订要它）
+let videoSubOff = false;// 是我们主动摘掉的（不是发送端取消发布）
+let unsubTimer = null;
+let roomRef = null;     // connect 里的 room，给退订逻辑按 sid 找 publication 用
 let aTrack = null;      // 已订阅的系统声音轨
 let soundEl = null;     // 声音挂在独立的 <audio> 上（video 元素是 muted 的，为的是绕开自动播放限制）
 let soundMuted = true; // 默认静音：观看端与分享端同机时外放会被环回再抓一遍；用户也要求默认不开声音。要听就点"声音 开"
@@ -621,7 +631,7 @@ function paintSoundBtn() {
 }
 
 async function loadWasm() {
-  const url = 'ess_web.wasm?v=20261105d';
+  const url = 'ess_web.wasm?v=20261105e';
   let inst;
   try {
     inst = await WebAssembly.instantiateStreaming(fetch(url), {});
@@ -747,6 +757,46 @@ function applyPlane() {
   canvas.hidden = showVideo;
   // 两种平面的固有尺寸可能不同：切换后重新按“适应”算一次
   layoutView();
+  syncVideoSub();
+}
+
+// 从 participant 的 publication 表里找回视频轨对应的那一条：TrackSubscribed 给的是
+// RemoteTrack，它身上没有回指 publication 的字段，只有 sid 能对上。
+function findVideoPub(track) {
+  if (!roomRef) return null;
+  try {
+    const parts = roomRef.remoteParticipants;
+    const it = parts && parts.values ? parts.values() : [];
+    for (const p of it) {
+      const pubs = p && p.videoTrackPublications;
+      if (!pubs || !pubs.values) continue;
+      for (const pub of pubs.values()) {
+        if (track && pub.trackSid === track.sid) return pub;
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+// 按当前平面决定视频轨该不该订阅。迟滞 10 s：短暂进出平面（滚动、翻页）不该来回
+// 摘订阅——每次复订都要等一次关键帧，那才是用户看得见的代价。
+function syncVideoSub() {
+  if (!videoPub) return;
+  if (videoOn) {
+    if (unsubTimer) { clearTimeout(unsubTimer); unsubTimer = null; }
+    if (videoSubOff) {
+      videoSubOff = false;
+      try { videoPub.setSubscribed(true); } catch (e) { lastError = '恢复视频订阅失败: ' + e.message; }
+    }
+    return;
+  }
+  if (videoSubOff || unsubTimer) return;
+  unsubTimer = setTimeout(() => {
+    unsubTimer = null;
+    if (videoOn || !videoPub) return;
+    videoSubOff = true;
+    try { videoPub.setSubscribed(false); } catch (e) { lastError = '退订视频轨失败: ' + e.message; }
+  }, UNSUB_AFTER_MS);
 }
 
 function armVideo() {
@@ -858,6 +908,7 @@ async function main() {
   if (!cfgRes.ok) throw new Error(`获取房间令牌失败（HTTP ${cfgRes.status}）`);
   const cfg = await cfgRes.json();
   const room = new Room({ adaptiveStream: false, dynacast: false });
+  roomRef = room;
   room.on(RoomEvent.DataReceived, (payload, kind) => {
     const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
     // 速率按**到达**算，所以在闸门之前累计：被本机丢掉的过时内容同样吃掉了链路带宽，
@@ -934,6 +985,8 @@ async function main() {
     if (track.kind !== 'video') return;
     const fresh = track !== vTrack;
     vTrack = track;
+    videoPub = findVideoPub(track) || videoPub;
+    videoSubOff = false;
     try {
       if (typeof track.attach === 'function') {
         track.attach(video);
@@ -1071,6 +1124,8 @@ async function main() {
     },
     errors: () => state.errors,
     plane: () => (videoOn ? (vTrack ? 'video' : 'video-pending') : 'tiles'),
+    // 视频轨的订阅状态：`off` = 已主动退订（图块平面挂满 10 s），`timer` = 正在等迟滞
+    sub: () => ({ pub: !!videoPub, off: videoSubOff, timer: !!unsubTimer }),
     // 新鲜度闸门的读数与钉住开关（自动化验收用）
     shed: () => ({
       on: shedOn,

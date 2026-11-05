@@ -1222,6 +1222,19 @@ pub async fn run(
     let mut fps_before_warm: Option<u32> = None;
     // 本段视频平面的开始时刻（爬坡期豁免用）
     let mut plane_on_at: Option<Instant> = None;
+    // 图块平面挂久了就**彻底停喂**视频轨。静止保活帧（~2 fps）买的是"切进视频平面
+    // 时画面是当前的"，代价是全程上行——实测 1080p 静止画面 0.10 Mbps（`enc` 仍在
+    // 1440x808@2.0、`vsent` 3.3 fps），关掉保活立刻掉到 0.01 Mbps。用户在图块平面
+    // 待了这么久，说明他就是在看图块，不该继续为一次可能不发生的切换付带宽。
+    // 恢复的代价只有一次关键帧（见下面 STATS 的 vstop=）。
+    let idle_stop_after = std::env::var("ESS_IDLE_STOP")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|s| Duration::from_secs_f64(s.max(0.0)))
+        .unwrap_or(Duration::from_secs(10));
+    // 平面关着的起点（用来数"关多久了"）与真正停喂的时刻（None = 正在喂）
+    let mut idle_off_since: Option<Instant> = None;
+    let mut feed_stop_at: Option<Instant> = None;
 
     // 脱落 → 基线重建的状态：三个计数器都是累计值，比较增量就知道"这一帧之后链路上少了几条"
     let mut lost_prev = 0u64;
@@ -1341,15 +1354,37 @@ pub async fn run(
                 let was_video = p.video_mode();
                 let was_feeding = p.media_feeding();
                 if let Some(vp) = video.as_mut() {
+                    let feeding = p.media_feeding();
+                    if feeding {
+                        if let Some(t) = feed_stop_at.take() {
+                            emit(Event::Log(format!(
+                                "恢复喂帧（{}）→ 累计停喂 {:.1} s",
+                                if p.media_pending() { "预热" } else { "视频平面" },
+                                t.elapsed().as_secs_f64()
+                            )));
+                        }
+                        idle_off_since = None;
+                    } else if idle_stop_after > Duration::ZERO {
+                        let since = *idle_off_since.get_or_insert_with(Instant::now);
+                        if feed_stop_at.is_none() && since.elapsed() >= idle_stop_after {
+                            feed_stop_at = Some(Instant::now());
+                            emit(Event::Log(format!(
+                                "图块平面已持续 {:.0} s → 停喂视频轨（不再为一次未必发生的切换付上行）",
+                                since.elapsed().as_secs_f64()
+                            )));
+                        }
+                    }
                     // 预热期也按满帧率喂：编码器需要在这段时间里把输入帧率从静止节拍
                     // 拉到声明帧率，不喂它就永远拉不上去（见 SendPipeline::plane_handover）
-                    let every = if p.media_feeding() { 1 } else { idle_feed_every };
-                    if feed_n % every == 0 {
-                        let tf = Instant::now();
-                        vp.push(&frame);
-                        let d = tf.elapsed().as_micros();
-                        win_feed_us += d;
-                        win_feed_max = win_feed_max.max(d);
+                    if feed_stop_at.is_none() {
+                        let every = if feeding { 1 } else { idle_feed_every };
+                        if feed_n % every == 0 {
+                            let tf = Instant::now();
+                            vp.push(&frame);
+                            let d = tf.elapsed().as_micros();
+                            win_feed_us += d;
+                            win_feed_max = win_feed_max.max(d);
+                        }
                     }
                 }
                 let tp = Instant::now();
@@ -1972,7 +2007,7 @@ pub async fn run(
                     .map(|p| (p.budget_bps(), p.stats.budget_forced))
                     .unwrap_or((0, 0));
                 eprintln!(
-                    "STATS fps_cap={} avail={:.2}Mbps egress={:.2}Mbps audio={:.1}kbps(audiotgt={:.0} pkt={:.0}/s) rtt={:.1}ms loss={:.3} rx_rtt={:.1}ms target={:.2}Mbps enc={}x{}@{:.1} vsent={:.1} ql_bw={:.2} nack={:.0} qdelay={}ms qp={} bw_limited={} cpu_limited={} res_changes={} tile_budget={} forced_plane={} lag={}ms q={} stale={} enc_press={} strain={} warm={} strain_forced={} tile_enc={:.1}ms tile_diff={:.1}ms tile_pack={:.1}ms tile_detect={:.1}ms feed={:.1}ms feed_max={:.1}ms pipe={:.1}ms pipe_max={:.1}ms push_new={:.1}ms push_cvt={:.1}ms push_cap={:.1}ms tile_bytes={} tiles={} updates={} egress_cap={} shed={} missing={} behind={} reports={} send={:.0}ms inj={} lossy={}",
+                    "STATS fps_cap={} avail={:.2}Mbps egress={:.2}Mbps audio={:.1}kbps(audiotgt={:.0} pkt={:.0}/s) rtt={:.1}ms loss={:.3} rx_rtt={:.1}ms target={:.2}Mbps enc={}x{}@{:.1} vsent={:.1} ql_bw={:.2} nack={:.0} qdelay={}ms qp={} bw_limited={} cpu_limited={} res_changes={} tile_budget={} forced_plane={} lag={}ms q={} stale={} enc_press={} strain={} warm={} vstop={:.1} strain_forced={} tile_enc={:.1}ms tile_diff={:.1}ms tile_pack={:.1}ms tile_detect={:.1}ms feed={:.1}ms feed_max={:.1}ms pipe={:.1}ms pipe_max={:.1}ms push_new={:.1}ms push_cvt={:.1}ms push_cap={:.1}ms tile_bytes={} tiles={} updates={} egress_cap={} shed={} missing={} behind={} reports={} send={:.0}ms inj={} lossy={}",
                     fps_ctl.load(Ordering::Relaxed),
                     link.avail_bps / 1e6,
                     link.egress_bps / 1e6,
@@ -2002,6 +2037,9 @@ pub async fn run(
                     enc_pressure,
                     pipeline.as_ref().map(|p| p.receiver_strain).unwrap_or(false),
                     pipeline.as_ref().map(|p| p.media_pending()).unwrap_or(false),
+                    // 视频轨停喂了多久（0 = 正在喂）。图块平面挂久之后这一项要能看见，
+                    // 否则"上行掉到 0.01 Mbps"到底是停喂生效还是统计坏了分不清。
+                    feed_stop_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0),
                     pipeline.as_ref().map(|p| p.stats.strain_forced).unwrap_or(0),
                     tile_enc_ms,
                     tile_diff_ms,
