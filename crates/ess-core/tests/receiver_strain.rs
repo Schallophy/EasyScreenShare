@@ -55,6 +55,23 @@ fn mild(k: u32) -> Frame {
     f
 }
 
+/// 比 `mild` 多改 11 块（共 12/64 ≈ 19%）：超过预算/编码平面的变化率门槛（10%），
+/// 但仍低于运动阈值（25%），所以平面出现只可能来自被测试的那条判据。
+fn moderate(k: u32) -> Frame {
+    let mut f = mild(k);
+    for t in 1..12u32 {
+        let bx = (t % 8) * 64;
+        let by = (t / 8) * 64;
+        for y in by..by + 64 {
+            for x in bx..bx + 64 {
+                let o = y as usize * f.stride + x as usize * 4;
+                f.px[o..o + 4].copy_from_slice(&(0xff00_0000u32 | (k + t)).to_le_bytes());
+            }
+        }
+    }
+    f
+}
+
 fn codecs() -> CodecSet<'static> {
     CodecSet { codecs: Box::leak(vec![&RawCodec as &dyn TileCodec].into_boxed_slice()) }
 }
@@ -98,7 +115,7 @@ fn budget_keeps_the_attribution_when_strain_is_also_true() {
     p.set_budget_bps(1); // 什么都装不下
     p.receiver_strain = true;
     for k in 1..4 {
-        p.on_frame(&mild(k)).unwrap();
+        p.on_frame(&moderate(k)).unwrap();
     }
     assert!(p.video_mode());
     assert!(p.stats.budget_forced >= 1, "归因给此刻真正装不下的那一条");
@@ -113,7 +130,7 @@ fn encode_pressure_outranks_strain_in_the_attribution() {
     p.set_encode_pressure(true);
     p.receiver_strain = true;
     for k in 1..4 {
-        p.on_frame(&mild(k)).unwrap();
+        p.on_frame(&moderate(k)).unwrap();
     }
     assert!(p.video_mode());
     assert!(p.stats.encode_forced >= 1);

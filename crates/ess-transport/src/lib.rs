@@ -62,7 +62,7 @@ pub async fn connect(url: &str, token: &str) -> Result<Conn, String> {
 
 /// 把一条 Update 按块拆成多条自包含消息（每条都带完整头，可独立应用）。
 pub fn split_update(msg: &WireMsg) -> Vec<WireMsg> {
-    let WireMsg::Update { seq, layout_id, cols, rows, tiles, repair } = msg else {
+    let WireMsg::Update { seq, layout_id, cols, rows, tiles, repair, .. } = msg else {
         return vec![msg.clone()];
     };
     let mut out = Vec::new();
@@ -77,6 +77,8 @@ pub fn split_update(msg: &WireMsg) -> Vec<WireMsg> {
                 cols: *cols,
                 rows: *rows,
                 repair: *repair,
+                part: 0,
+                total: 0,
                 tiles: std::mem::take(&mut batch),
             });
             size = 0;
@@ -91,8 +93,19 @@ pub fn split_update(msg: &WireMsg) -> Vec<WireMsg> {
             cols: *cols,
             rows: *rows,
             repair: *repair,
+            part: 0,
+            total: 0,
             tiles: batch,
         });
+    }
+    // 标注拆片序号与总数：观看端据此把一帧的所有片凑齐后**一次性应用**，
+    // 避免半帧上屏造成撕裂（分片本身共享 seq，但没有片号就无法判定"到齐"）。
+    let total = out.len() as u32;
+    for (idx, m) in out.iter_mut().enumerate() {
+        if let WireMsg::Update { part, total: t, .. } = m {
+            *part = idx as u32;
+            *t = total;
+        }
     }
     out
 }
@@ -268,6 +281,8 @@ mod tests {
             cols: 30,
             rows: 17,
             repair: false,
+            part: 0,
+            total: 0,
             tiles: (0..needed).map(|i| tile(i as u16, per)).collect(),
         };
         let parts = split_update(&msg);
@@ -284,6 +299,8 @@ mod tests {
             cols: 30,
             rows: 17,
             repair: false,
+            part: 0,
+            total: 0,
             tiles: (0..fits).map(|i| tile(i as u16, per)).collect(),
         };
         assert_eq!(split_update(&small).len(), 1, "装得下却拆了");

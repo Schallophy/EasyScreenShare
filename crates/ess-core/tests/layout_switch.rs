@@ -57,6 +57,8 @@ fn missing_full_is_requested_and_new_layout_rebuilds_canvas() {
         cols: 2,
         rows: 2,
         repair: false,
+        part: 0,
+        total: 0,
         tiles: vec![tile(0, 64, 64, 5)],
     };
     rx.on_wire(&upd).unwrap();

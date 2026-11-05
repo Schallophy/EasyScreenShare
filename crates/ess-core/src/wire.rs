@@ -32,6 +32,10 @@ pub enum WireMsg {
         tiles: Vec<WireTile>,
         /// true = 运动退出的精确修复：走可靠通道（见 TilesUpdate.repair）
         repair: bool,
+        /// 本条是这次更新拆出的第几片（0 基）。0 且 `total == 0` = 未拆分。
+        part: u32,
+        /// 这次更新一共拆了几片。接收端按它判定整帧到齐后再原子应用。
+        total: u32,
     },
     Scroll {
         seq: u32,
@@ -189,12 +193,14 @@ impl SeqGaps {
 
 pub fn encode(msg: &WireMsg) -> Result<Vec<u8>, WireError> {
     let body = match msg {
-        WireMsg::Update { seq, layout_id, cols, rows, tiles, repair } => {
+        WireMsg::Update { seq, layout_id, cols, rows, tiles, repair, part, total } => {
             proto::envelope::Body::Update(proto::TilesUpdate {
                 hdr: Some(header(*seq, *layout_id)),
                 cols: *cols as u32,
                 rows: *rows as u32,
                 repair: *repair,
+                part: *part,
+                total: *total,
                 tiles: tiles
                     .iter()
                     .map(|t| proto::Tile {
@@ -308,6 +314,8 @@ pub fn decode(bytes: &[u8]) -> Result<WireMsg, WireError> {
                 cols: u.cols as u16,
                 rows: u.rows as u16,
                 repair: u.repair,
+                part: u.part,
+                total: u.total,
                 tiles: u
                     .tiles
                     .into_iter()
@@ -428,6 +436,8 @@ mod tests {
             cols: 30,
             rows: 17,
             repair: true,
+            part: 2,
+            total: 5,
             tiles: vec![WireTile {
                 id: TileId(42),
                 codec: TileCodecId::PaletteZstd,

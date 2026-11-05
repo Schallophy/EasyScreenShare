@@ -303,7 +303,10 @@ pub unsafe extern "C" fn ess_viewer_video_ready(p: *mut Viewer, ready: u32) {
     (*p).recv.accept_video_plane = ready != 0;
 }
 
-/// 诊断计数：[chunks, applied_ok, applied_err, decode_err, serial, layout_id]。
+/// 诊断计数：[chunks, applied_ok, applied_err, decode_err, serial, layout_id,
+/// upd_msgs, full_msgs, scroll_msgs, state_msgs, canvas_w, canvas_h, grid_cols,
+/// grid_rows, full_layout, video_mode, motion_skipped, seq_gaps,
+/// 丢帧（残帧）, 原子帧]。
 ///
 /// # Safety
 /// `p` 有效；`out`/`cap` 指向可写内存。
@@ -332,6 +335,11 @@ pub unsafe extern "C" fn ess_viewer_diag(p: *const Viewer, out: *mut u32, cap: u
         v.recv.video_mode() as u32,
         v.recv.stats.motion_skipped as u32,
         v.seqg.gaps as u32,
+        // 凑不齐整帧而被丢弃的更新数（含拆片丢片）。与 seq 空洞不同：拆片共享同一个
+        // seq，所以丢片在 seq 上完全看不出来，只有接收端自己知道。观看端据此**立刻**
+        // 补一份报告，而不是干等下一个 500 ms 刻度（快速打开/最小化窗口时最明显）。
+        v.recv.stats.update_frames_dropped as u32,
+        v.recv.stats.updates_atomic as u32,
     ];
     let n = vals.len().min(cap);
     std::ptr::copy_nonoverlapping(vals.as_ptr(), out, n);

@@ -631,3 +631,64 @@ fn a_partial_row_tile_changed_during_the_plane_is_repaired_on_exit() {
         }
     }
 }
+
+/// 拆片更新必须**整帧到齐**才落画布。
+///
+/// 现场撕裂：`split_update` 把一次逐块更新按 60 KB 拆成十几条消息（共享 seq）。
+/// 接收端以前逐条应用，而观看端每十几毫秒就上屏一次，于是两次上屏之间画布会停在
+/// "一半新、一半旧"的拼接上。这里用 2 片模拟：只送到第 1 片时画布必须一个像素都不变。
+#[test]
+fn split_update_is_applied_only_when_every_part_arrives() {
+    let f0 = noise(0, 128, 128);
+    let mut p = SendPipeline::new(f0.clone(), codecs());
+    p.motion_enabled = false;
+    let mut recv = ess_core::pipeline::RecvPipeline::new(codecs());
+
+    feed_recv(&mut recv, p.on_frame(&f0).unwrap());
+    let base = recv.canvas.px.clone();
+
+    // 两块都改：得到的更新至少有两块可以拆
+    let mut f1 = f0.clone();
+    f1.ts_us = 100_000;
+    edit(&mut f1, 8, 8);
+    edit(&mut f1, 70, 70);
+    let msgs = p.on_frame(&f1).unwrap();
+    let mut upd = None;
+    for m in msgs {
+        if let WireMsg::Update { seq, layout_id, cols, rows, tiles, repair, .. } = m {
+            if !tiles.is_empty() {
+                upd = Some((seq, layout_id, cols, rows, repair, tiles));
+                break;
+            }
+        }
+    }
+    let (seq, layout_id, cols, rows, repair, tiles) = upd.expect("第二帧应是逐块更新");
+    assert!(tiles.len() >= 2, "测试需要至少两块才能拆片");
+    let half = tiles.len() / 2;
+    let p0 = WireMsg::Update {
+        seq,
+        layout_id,
+        cols,
+        rows,
+        repair,
+        part: 0,
+        total: 2,
+        tiles: tiles[..half].to_vec(),
+    };
+    let p1 = WireMsg::Update {
+        seq,
+        layout_id,
+        cols,
+        rows,
+        repair,
+        part: 1,
+        total: 2,
+        tiles: tiles[half..].to_vec(),
+    };
+
+    recv.on_wire(&p0).expect("part 0");
+    assert_eq!(recv.canvas.px, base, "只到一半的更新不许上屏（否则就是撕裂）");
+    recv.on_wire(&p1).expect("part 1");
+    assert_eq!(recv.canvas.px, f1.px, "所有片到齐后应一次落画");
+    assert!(recv.stats.updates_atomic >= 1);
+}

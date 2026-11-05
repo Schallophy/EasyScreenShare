@@ -33,7 +33,7 @@ let vArmedBase = 0;     // on 到达时的累计解码帧数
 let aTrack = null;      // 已订阅的系统声音轨
 let soundEl = null;     // 声音挂在独立的 <audio> 上（video 元素是 muted 的，为的是绕开自动播放限制）
 let soundMuted = true; // 默认静音：观看端与分享端同机时外放会被环回再抓一遍；用户也要求默认不开声音。要听就点"声音 开"
-const state = { msgs: 0, errors: 0, w: 0, h: 0, serial: 0, feed_ms: 0, feed_n: 0, dropped: 0, loss: 0, duty: 0 };
+const state = { msgs: 0, errors: 0, w: 0, h: 0, serial: 0, feed_ms: 0, feed_n: 0, dropped: 0, loss: 0, duty: 0, partsDropped: 0 };
 
 // 观看端新鲜度闸门（手机上最关键的一条）。RTC 数据通道在浏览器侧没有反压：解码跟不上
 // 到达速率时，消息就堆在事件循环里按序播放——表现正是"时间轴一直漂移、观看端不追最新
@@ -358,6 +358,15 @@ function syncPlane() {
 // 切回前台时平面状态是旧的（发送端早已切到视频轨）。
 function tick() {
   const now = performance.now();
+  // 序列空洞与"残帧"计数每个拍子都要刷新（早报要用），与 1 s 的 HUD 刷新分开。
+  // 残帧 = 接收端凑不齐整帧而丢掉的那一帧：拆片共享同一个 seq，丢片在 seq 空洞上
+  // 完全看不出来，但它是"图块残留"的直接证据，值得立刻补一份报告。
+  const dn = ex.ess_viewer_diag(viewer, diagPtr, 32);
+  if (dn > 17) {
+    const dv = new Uint32Array(mem.buffer, diagPtr, dn);
+    state.loss = dv[17];
+    if (dn > 18) state.partsDropped = dv[18];
+  }
   if (now - lastFpsAt < 1000) return;
   const total = videoFramesTotal();
   // 视频平面时图块计数不动，帧率要从播放器的累计解码帧里取
@@ -372,8 +381,6 @@ function tick() {
   // 序列空洞（diag 末槽）：没按序到达的发送端消息数。口径要说清——本地 shed 闸门挡下的
   // 消息同样不会进 wasm，所以这个数含「链路丢」与「本机解码闸门丢」两部分；闸门关掉
   // （平时 duty 不高）时它就等于链路丢的量。与 丢=（只数本机闸门）分开看。
-  const dn = ex.ess_viewer_diag(viewer, diagPtr, 32);
-  if (dn > 17) state.loss = new Uint32Array(mem.buffer, diagPtr, dn)[17];
   hud.textContent = hudText();
 }
 
@@ -552,6 +559,18 @@ async function main() {
   // 回来——那正是补账活锁的入口。
   setInterval(() => {
     if (!shedOn && state.loss > gapsReported) sendReport();
+  }, 250);
+  // 残帧早报：拆片共享同一个 `seq`，丢片在序列空洞上完全看不出来；只有接收端知道
+  // 自己凑不齐整帧（`partsDropped` 递增）。动画/大面积变化期间，这份报告能把"图块
+  // 残留"的等待从 ≤500 ms 压到一个往返。同样受 `!shedOn` 约束——闸门开着时丢的是
+  // 本机主动丢的过时内容，去追它只会和新鲜度判定打架。
+  let partsDroppedReported = 0;
+  setInterval(() => {
+    if (shedOn) return;
+    if (state.partsDropped > partsDroppedReported) {
+      partsDroppedReported = state.partsDropped;
+      sendReport();
+    }
   }, 250);
 
   // 验收钩子：像素哈希 / 采样，供自动化比对

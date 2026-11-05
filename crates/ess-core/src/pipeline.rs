@@ -17,6 +17,17 @@ use crate::scroll::{apply_vscroll, detect};
 use crate::wire::{WireMsg, WireTile};
 use crate::{TILE, SUBTILE};
 
+/// 报告重发的分块粒度：每块自成一条消息（各自一个 `seq`），接收端逐块原子应用。
+///
+/// 报告差集在动画/大面积变化之后可能是整屏（几百块、上兆字节），而传输层会把一条
+/// 消息按 60 KB 拆成十几片**共享 `seq`**——接收端只能整组到齐才落画布（§14.7.35 的
+/// 撕裂修法）。丢任意一片就整组作废，下一份报告从头再来一次；现场表现正是"图块残留
+/// 要好几秒才补上"（快速打开/最小化窗口的弹出收回动画最容易撞上）。
+///
+/// 切小以后，丢一片只损失 8 块，其余立即上屏；下一份报告只补缺的那些，画面是渐进的
+/// 而不是全有或全无。8 块在 64x64 JPEG 最坏情况下约 32 KB，仍在单条消息预算内。
+const REPORT_CHUNK_TILES: usize = 8;
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct SendStats {
     pub frames: u64,
@@ -63,6 +74,12 @@ pub struct RecvStats {
     pub motion_frames: u64,
     /// 视频模式下被跳过的 JPEG 兜底帧（本端走媒体通道）
     pub motion_skipped: u64,
+    /// 凑齐并原子应用的拆片更新帧数
+    pub updates_atomic: u64,
+    /// 新帧到来时仍未凑齐、被丢弃的残帧数（缺块由状态报告补）
+    pub update_frames_dropped: u64,
+    /// 迟到/重复的旧拆片数
+    pub update_parts_stale: u64,
 }
 
 /// 编码器集合：按顺序尝试（首个为主编码器），解码按 id 路由。
@@ -1156,18 +1173,26 @@ impl<'c> SendPipeline<'c> {
         if tiles.is_empty() {
             return Ok(Vec::new());
         }
-        let msg = Message::Update {
-            layout_id: self.ctl.layout_id,
-            cols: self.grid.cols,
-            rows: self.grid.rows,
-            tiles,
-        };
+        let layout_id = self.ctl.layout_id;
         let frame = self.state.last_sent.clone();
         // 这里仍然走 lossy，不是疏忽：把"承认的缺口"改挂可靠通路实测**更差**（照片素材同一臂
         // 单轮：`report_resends` 2409→2707、`tile_bytes` 11.55→12.81 MB、闸门丢掉 26→31）。
         // 可靠是有序且队头阻塞的——一份修复压在前面，其后几帧的新内容反而被判过时丢掉，
         // 于是又要更多修复。要治的是那批字节本身，不是这条通道的顺序。
-        Ok(vec![self.wire_update(msg, &frame, false)?])
+        //
+        // 但**不能再让整份差集共享一个 seq**：那样丢一片就整份作废（见
+        // `REPORT_CHUNK_TILES` 的注释）。逐块切条后每条独立原子落地，丢片只损失那一小条。
+        let mut out = Vec::with_capacity(tiles.len().div_ceil(REPORT_CHUNK_TILES));
+        for chunk in tiles.chunks(REPORT_CHUNK_TILES) {
+            let msg = Message::Update {
+                layout_id,
+                cols: self.grid.cols,
+                rows: self.grid.rows,
+                tiles: chunk.to_vec(),
+            };
+            out.push(self.wire_update(msg, &frame, false)?);
+        }
+        Ok(out)
     }
 
     fn wire_update(&mut self, msg: Message, cur: &Frame, repair: bool) -> Result<WireMsg, CodecError> {
@@ -1213,9 +1238,22 @@ impl<'c> SendPipeline<'c> {
             cols,
             rows,
             repair,
+            part: 0,
+            total: 0,
             tiles: wt,
         })
     }
+}
+
+/// 一次拆片更新在接收端的暂存：所有片到齐才一次性应用。
+struct UpdateGroup {
+    seq: u32,
+    layout_id: u32,
+    cols: u16,
+    rows: u16,
+    total: u32,
+    /// part 序号 → 该片解码后的 (线格式块, BGRA) 列表
+    parts: HashMap<u32, Vec<(WireTile, Vec<u8>)>>,
 }
 
 pub struct RecvPipeline<'c> {
@@ -1226,8 +1264,14 @@ pub struct RecvPipeline<'c> {
     pub stats: RecvStats,
     /// 未完成滚动组：(scroll_id) → (targets, dirty)
     pending: HashMap<u32, (Vec<(TileId, u32)>, Vec<TileId>)>,
-    /// 组内等待完成的像素：(scroll_id, tile) → 解码后的紧排 BGRA
-    grouped_raw: HashMap<(u32, TileId), Vec<u8>>,
+    /// 组内等待完成的像素：(scroll_id, tile) → (线上几何, 解码后的紧排 BGRA)
+    grouped_raw: HashMap<(u32, TileId), (TileGeom, Vec<u8>)>,
+    /// 尚未凑齐的拆片更新。一次逐块更新被传输层拆成 N 条消息（共享 seq），
+    /// 所有片到齐前**不落画布**：否则画布会在两次上屏之间出现半帧新、半帧旧
+    /// 的拼接（撕裂）。新 seq 一到就丢弃旧的残缺组（缺块由状态报告补回）。
+    pending_update: Option<UpdateGroup>,
+    /// 最近一次见过的更新 seq（用于丢弃迟到的旧拆片）
+    last_update_seq: u32,
     layout_id: u32,
     /// 已由整帧建立（像素完整）的布局代次。新布局只有收到整帧才算建立；
     /// 之前的更新可能已把网格推进，但画布像素不完整，报告必须请求整帧。
@@ -1259,6 +1303,8 @@ impl<'c> RecvPipeline<'c> {
             stats: RecvStats::default(),
             pending: HashMap::new(),
             grouped_raw: HashMap::new(),
+            pending_update: None,
+            last_update_seq: 0,
             layout_id: 0,
             full_layout: 0,
             accept_video_plane: false,
@@ -1291,52 +1337,8 @@ impl<'c> RecvPipeline<'c> {
 
     pub fn on_wire(&mut self, msg: &WireMsg) -> Result<(), CodecError> {
         match msg {
-            WireMsg::Update { layout_id, cols, rows, tiles, .. } => {
-                if *layout_id > self.rx.layout_id {
-                    // 新布局的首批更新可能先于整帧到达：先按 Update 自带的
-                    // 网格重建画布与判定状态，避免旧尺寸画布与新坐标混拼。
-                    // 尺寸按整块网格估（最后一行/列可能多出余量），整帧到达后校准。
-                    self.rx.on_message(&Message::Update {
-                        layout_id: *layout_id,
-                        cols: *cols,
-                        rows: *rows,
-                        tiles: Vec::new(),
-                    });
-                    self.layout_id = *layout_id;
-                    self.grid = TileGrid { cols: *cols, rows: *rows };
-                    self.canvas = Frame::new(
-                        *cols as u32 * crate::TILE,
-                        *rows as u32 * crate::TILE,
-                        0,
-                    );
-                    self.mark_dirty_all();
-                    self.pending.clear();
-                    self.grouped_raw.clear();
-                }
-                for t in tiles {
-                    let raw = self.decode_tile(t)?;
-                    let model_tile = model::TileMsg {
-                        id: t.id,
-                        epoch: t.epoch,
-                        version: t.version,
-                        content: tile_hash(&raw),
-                    };
-                    let verdict = self.rx.on_tile(model_tile);
-                    match verdict {
-                        model::Verdict::Applied => {
-                            self.blit(t.id, &raw);
-                            self.stats.applied_tiles += 1;
-                        }
-                        model::Verdict::Buffered => {
-                            if let Some(sid) = self.group_of(t.id, t.epoch) {
-                                self.grouped_raw.insert((sid, t.id), raw);
-                            }
-                            self.stats.buffered_tiles += 1;
-                        }
-                        _ => self.stats.stale_dropped += 1,
-                    }
-                }
-                self.drain_completed_scrolls();
+            WireMsg::Update { seq, layout_id, cols, rows, tiles, part, total, .. } => {
+                self.on_update_parts(*seq, *layout_id, *cols, *rows, tiles, *part, *total)?;
             }
             WireMsg::Scroll { layout_id, scroll_id, dy, targets, dirty, .. } => {
                 self.layout_id = *layout_id;
@@ -1373,13 +1375,41 @@ impl<'c> RecvPipeline<'c> {
                 self.video_mode = *on;
             }
             WireMsg::Full { layout_id, w, h, codec, codecs, versions, epochs, payloads, .. } => {
+                // 旧布局的整帧晚到：模型会拒绝它，画布更不能先被它写一遍。
+                if *layout_id < self.rx.layout_id {
+                    self.stats.stale_dropped += 1;
+                    return Ok(());
+                }
                 self.layout_id = *layout_id;
                 let grid = TileGrid::for_frame(*w, *h);
+                // 同布局的整帧只是一份**可能过时**的快照：它在可靠通道上要传好几秒
+                // （1080p 一到几 MB），这段时间 lossy 通路的新块可能已经先到并落了画布。
+                // 模型有"整帧不得覆盖更新状态"的保护（版本不回退），但旧代码在这里
+                // 无条件把画布整体重建再写回整帧内容——于是出现"画布比版本旧"：
+                // 报告认为一切齐了，残留永远补不回来，只有那块内容再次变化（鼠标划过）
+                // 才会被新版本盖住。所以同布局时要保留已有像素，只补模型真正接受的块。
+                let same_layout = *layout_id == self.rx.layout_id && self.grid == grid;
+                let before: Vec<u32> = if same_layout { self.rx.version.clone() } else { Vec::new() };
+                // 画布尺寸对齐到整帧的真实宽高（同布局下通常是从 cols*64 收敛到 1080），
+                // 但**逐行搬运已有像素**，不整幅清零。
+                if self.canvas.w != *w || self.canvas.h != *h {
+                    let mut canvas = Frame::new(*w, *h, 0);
+                    if same_layout && self.canvas.w > 0 {
+                        let keep_w = (self.canvas.w.min(*w) as usize) * 4;
+                        for y in 0..(self.canvas.h.min(*h) as usize) {
+                            let ds = y * canvas.stride;
+                            let ss = y * self.canvas.stride;
+                            canvas.px[ds..ds + keep_w].copy_from_slice(&self.canvas.px[ss..ss + keep_w]);
+                        }
+                        canvas.ts_us = self.canvas.ts_us;
+                    }
+                    self.canvas = canvas;
+                    self.mark_dirty_all();
+                }
                 self.grid = grid;
-                self.canvas = Frame::new(*w, *h, 0);
-                self.mark_dirty_all();
                 let mut contents = Vec::with_capacity(payloads.len());
                 let n = grid.tile_count().min(payloads.len());
+                let mut decoded = Vec::with_capacity(n);
                 for i in 0..n {
                     let id = TileId(i as u16);
                     let g = grid.geom(id, *w, *h);
@@ -1396,7 +1426,7 @@ impl<'c> RecvPipeline<'c> {
                     };
                     let raw = self.decode_tile(&t)?;
                     contents.push(tile_hash(&raw));
-                    self.blit(id, &raw);
+                    decoded.push((i, g, raw));
                 }
                 let full = Message::FullFrame {
                     layout_id: *layout_id,
@@ -1407,6 +1437,18 @@ impl<'c> RecvPipeline<'c> {
                     contents,
                 };
                 self.rx.on_message(&full);
+                for (i, g, raw) in decoded {
+                    // 与模型的保护同一把尺子：整帧里比现有版本旧的块不写画布，
+                    // 保留已经落上的新像素。
+                    let accepted = !same_layout
+                        || versions.get(i).copied().unwrap_or(0)
+                            >= before.get(i).copied().unwrap_or(0);
+                    if accepted {
+                        self.blit(g, &raw);
+                    } else {
+                        self.stats.stale_dropped += 1;
+                    }
+                }
                 self.pending.clear();
                 self.grouped_raw.clear();
                 self.rx.take_completed_scrolls();
@@ -1425,11 +1467,166 @@ impl<'c> RecvPipeline<'c> {
         Ok(raw)
     }
 
-    fn blit(&mut self, id: TileId, raw: &[u8]) {
-        if self.canvas.w == 0 {
+    /// 一条逐块更新（可能是拆片的一部分）。
+    ///
+    /// 未拆分（`total <= 1`，含旧发送端）直接应用；拆片更新先按 `seq` 暂存，
+    /// **所有片到齐**后一次性落画布。分片共享 `seq` 但以前没有片号，接收端
+    /// 只能逐条应用——两次上屏之间到一半，画布就出现"半帧新、半帧旧"的
+    /// 拼接（用户报的撕裂）。新 `seq` 一到就丢弃旧的残缺组：缺的块会由
+    /// 500 ms 的状态报告按版本差要回来，宁可晚一帧也不要拼半帧。
+    fn on_update_parts(
+        &mut self,
+        seq: u32,
+        layout_id: u32,
+        cols: u16,
+        rows: u16,
+        tiles: &[WireTile],
+        part: u32,
+        total: u32,
+    ) -> Result<(), CodecError> {
+        if total <= 1 {
+            let decoded = self.decode_tiles(tiles)?;
+            self.apply_update_tiles(layout_id, cols, rows, &decoded)?;
+            if seq > self.last_update_seq {
+                self.last_update_seq = seq;
+            }
+            return Ok(());
+        }
+        // 迟到的旧拆片：seq 已经翻过去，画面早就不等它了
+        if seq < self.last_update_seq {
+            self.stats.update_parts_stale += 1;
+            return Ok(());
+        }
+        // 换帧：旧的残缺组整组丢弃（迟到片不可能再补齐这一帧）
+        if self.pending_update.as_ref().map(|g| g.seq) != Some(seq) {
+            if let Some(g) = self.pending_update.take() {
+                if seq <= g.seq {
+                    // 同 seq 的重复/更旧片：保留原组
+                    if seq < g.seq {
+                        self.stats.update_parts_stale += 1;
+                    }
+                    self.pending_update = Some(g);
+                    return Ok(());
+                }
+                self.stats.update_frames_dropped += 1;
+            }
+            self.pending_update = Some(UpdateGroup {
+                seq,
+                layout_id,
+                cols,
+                rows,
+                total,
+                parts: HashMap::new(),
+            });
+            if seq > self.last_update_seq {
+                self.last_update_seq = seq;
+            }
+        }
+        let total_in_group = self.pending_update.as_ref().expect("刚建立").total;
+        if part >= total_in_group {
+            // 片号越界是协议错误；按单条应用，别把画面永久卡在待齐状态
+            self.pending_update = None;
+            let decoded = self.decode_tiles(tiles)?;
+            self.apply_update_tiles(layout_id, cols, rows, &decoded)?;
+            return Ok(());
+        }
+        if self
+            .pending_update
+            .as_ref()
+            .map(|g| g.parts.contains_key(&part))
+            .unwrap_or(false)
+        {
+            return Ok(()); // 重复片
+        }
+        let decoded = self.decode_tiles(tiles)?;
+        let g = self.pending_update.as_mut().expect("刚建立");
+        g.parts.insert(part, decoded);
+        let complete = (g.parts.len() as u32) == g.total;
+        if !complete {
+            return Ok(());
+        }
+        let mut g = self.pending_update.take().expect("到齐");
+        let mut idx: Vec<u32> = g.parts.keys().copied().collect();
+        idx.sort_unstable();
+        let mut all = Vec::new();
+        for i in idx {
+            if let Some(mut ts) = g.parts.remove(&i) {
+                all.append(&mut ts);
+            }
+        }
+        self.stats.updates_atomic += 1;
+        self.apply_update_tiles(g.layout_id, g.cols, g.rows, &all)
+    }
+
+    fn decode_tiles(&mut self, tiles: &[WireTile]) -> Result<Vec<(WireTile, Vec<u8>)>, CodecError> {
+        let mut out = Vec::with_capacity(tiles.len());
+        for t in tiles {
+            let raw = self.decode_tile(t)?;
+            out.push((t.clone(), raw));
+        }
+        Ok(out)
+    }
+
+    /// 把一批已解码的块落到模型与画布上（整帧基线/拆片到齐时调用）。
+    fn apply_update_tiles(
+        &mut self,
+        layout_id: u32,
+        cols: u16,
+        rows: u16,
+        decoded: &[(WireTile, Vec<u8>)],
+    ) -> Result<(), CodecError> {
+        if layout_id > self.rx.layout_id {
+            // 新布局的首批更新可能先于整帧到达：先按 Update 自带的
+            // 网格重建画布与判定状态，避免旧尺寸画布与新坐标混拼。
+            // 尺寸按整块网格估（最后一行/列可能多出余量），整帧到达后校准。
+            self.rx.on_message(&Message::Update {
+                layout_id,
+                cols,
+                rows,
+                tiles: Vec::new(),
+            });
+            self.layout_id = layout_id;
+            self.grid = TileGrid { cols, rows };
+            self.canvas = Frame::new(cols as u32 * crate::TILE, rows as u32 * crate::TILE, 0);
+            self.mark_dirty_all();
+            self.pending.clear();
+            self.grouped_raw.clear();
+        }
+        for (t, raw) in decoded {
+            let model_tile = model::TileMsg {
+                id: t.id,
+                epoch: t.epoch,
+                version: t.version,
+                content: tile_hash(raw),
+            };
+            let verdict = self.rx.on_tile(model_tile);
+            // 目标几何取**线上给的** x/y/w/h，不按画布估出来的网格算：新布局的首批
+            // 更新到达时画布是按 `cols*64 × rows*64` 估的（1080p 会高 8 像素），
+            // 网格算出的末行是 64 高，而线上块只有 56——那会让 blit 因"源不够长"
+            // 静默跳过，模型版本却前进了，又是"画布比版本旧"的残留。
+            let g = TileGeom { x: t.x, y: t.y, w: t.w, h: t.h };
+            match verdict {
+                model::Verdict::Applied => {
+                    self.blit(g, raw);
+                    self.stats.applied_tiles += 1;
+                }
+                model::Verdict::Buffered => {
+                    if let Some(sid) = self.group_of(t.id, t.epoch) {
+                        self.grouped_raw.insert((sid, t.id), (g, raw.clone()));
+                    }
+                    self.stats.buffered_tiles += 1;
+                }
+                _ => self.stats.stale_dropped += 1,
+            }
+        }
+        self.drain_completed_scrolls();
+        Ok(())
+    }
+
+    fn blit(&mut self, g: TileGeom, raw: &[u8]) {
+        if self.canvas.w == 0 || g.w == 0 || g.h == 0 {
             return;
         }
-        let g = self.grid.geom(id, self.canvas.w, self.canvas.h);
         blit_geom(&mut self.canvas, g, raw);
         self.mark_dirty(g);
     }
@@ -1503,8 +1700,8 @@ impl<'c> RecvPipeline<'c> {
             }
             if let Some((_, dirty)) = self.pending.remove(&sid) {
                 for id in dirty {
-                    if let Some(raw) = self.grouped_raw.remove(&(sid, id)) {
-                        self.blit(id, &raw);
+                    if let Some((g, raw)) = self.grouped_raw.remove(&(sid, id)) {
+                        self.blit(g, &raw);
                     }
                 }
             }
@@ -1514,14 +1711,23 @@ impl<'c> RecvPipeline<'c> {
 }
 
 fn blit_geom(canvas: &mut Frame, g: TileGeom, raw: &[u8]) {
-    let row_bytes = g.w as usize * 4;
-    if raw.len() < row_bytes * g.h as usize {
+    if g.x >= canvas.w || g.y >= canvas.h {
         return;
     }
-    for y in 0..g.h as usize {
+    let src_row = g.w as usize * 4;
+    // 源块必须完整：短包会被静默跳过——调用方（`blit`）已经把"线上几何"传进来，
+    // 所以这里只可能是真正的坏数据，不能拿缺行去写画布。
+    if raw.len() < src_row * g.h as usize {
+        return;
+    }
+    // 画布可能比真实帧大（新布局首批更新时按 cols*64 × rows*64 估的），
+    // 越界部分裁掉即可，绝不能因为末行高度对不上就整块放弃。
+    let copy_w = g.w.min(canvas.w - g.x) as usize;
+    let copy_h = g.h.min(canvas.h - g.y) as usize;
+    for y in 0..copy_h {
         let ds = (g.y as usize + y) * canvas.stride + g.x as usize * 4;
-        let ss = y * row_bytes;
-        canvas.px[ds..ds + row_bytes].copy_from_slice(&raw[ss..ss + row_bytes]);
+        let ss = y * src_row;
+        canvas.px[ds..ds + copy_w * 4].copy_from_slice(&raw[ss..ss + copy_w * 4]);
     }
 }
 

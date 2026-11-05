@@ -24,6 +24,16 @@ use livekit::prelude::{LocalTrack, LocalVideoTrack, TrackSource};
 use livekit::webrtc::video_source::RtcVideoSource;
 use video::VideoPlane;
 
+/// 守门员阶梯 → 实际帧率上限。
+///
+/// 阶梯按内容类不同（Text 顶 15 / Video 顶 30），所以必须用**同一个比例**去缩放
+/// 用户声明的 `fps_ceil`，否则一次降档后永远回不到用户要的那一档。入口与回升
+/// 都必须走这里，不能各自算一套。
+fn governed_fps(gov: &Governor, fps_ceil: u32) -> u32 {
+    ((fps_ceil as u64 * gov.settings().fps as u64) / gov.top_fps().max(1) as u64)
+        .clamp(1, fps_ceil.max(1) as u64) as u32
+}
+
 pub struct Config {
     pub url: String,
     pub room: String,
@@ -1206,6 +1216,10 @@ pub async fn run(
     let mut enc_pressure = false;
     // 上一帧时的视频平面状态，用来抓切换沿（送入尺寸的进入/退出修正）
     let mut vmode_prev = false;
+    // 预热开始前的图块通路帧率。预热会把采集抬到声明帧率（让编码器按满帧率预热），
+    // 但预热**被取消**时（内容没动到值得进平面）必须原样还回去，否则刚抬到 30 的
+    // 图块差分立刻超预算、守门员又降档，30↔20↔10 反复抖（用户报的果冻）。
+    let mut fps_before_warm: Option<u32> = None;
     // 本段视频平面的开始时刻（爬坡期豁免用）
     let mut plane_on_at: Option<Instant> = None;
 
@@ -1404,11 +1418,34 @@ pub async fn run(
                     if (!was_feeding && p.media_feeding())
                         || (p.video_mode() && !was_video)
                     {
+                        // 只有"从图块进入预热"这一沿才记旧值；交接沿/预算平面
+                        // 不算预热，没有可还的图块帧率。
+                        if !was_feeding && p.media_pending() {
+                            fps_before_warm = Some(fps_ctl.load(Ordering::Relaxed));
+                        }
+                        if p.video_mode() && !was_video {
+                            // 交接成功：平面接管，预热前的图块帧率作废
+                            fps_before_warm = None;
+                        }
                         let prev = fps_ctl.swap(fps_ceil, Ordering::Relaxed);
                         if prev < fps_ceil {
                             emit(Event::Log(format!(
                                 "进入媒体通路（预热/交接）→ 帧率上限 {prev} → {fps_ceil} fps（图块阶段的降档不带入媒体通路）"
                             )));
+                        }
+                    }
+                    // 预热被取消（内容没动到值得进平面）：把帧率原样还给图块通路。
+                    // 不还的话，为预热抬到 30 的采集节奏拿去跑 1080p 图块差分，
+                    // 每帧 30–45 ms > 33 ms 预算，守门员立刻再降一档；紧接着下一次
+                    // 预热又抬回去——实测整场在 30/20/10/4 之间来回抖，观看端就是果冻。
+                    if was_feeding && !p.media_feeding() && !p.video_mode() {
+                        if let Some(prev_fps) = fps_before_warm.take() {
+                            let prev = fps_ctl.swap(prev_fps, Ordering::Relaxed);
+                            if prev != prev_fps {
+                                emit(Event::Log(format!(
+                                    "预热取消 → 帧率上限 {prev} → {prev_fps} fps（回到图块通路的守门员档位）"
+                                )));
+                            }
                         }
                     }
                     vmode_prev = p.video_mode();
@@ -1472,6 +1509,22 @@ pub async fn run(
                 0.0
             };
             tile_enc_ms = tile_ms;
+            // 图块通路每秒吃掉的 CPU 份额（0–1）：`win_enc_us` 是这条管线在观测窗里
+            // 花掉的时间，除以窗长就是"吃掉几成核"。
+            //
+            // 判"能不能升回更高帧率"必须用它，不能拿单帧耗时比目标预算：1080p 差分/
+            // 编码是按**每秒变更面积**付钱的，30 fps 压到 20 fps 只是让每帧变更更多、
+            // 单帧更贵。实测同一段内容 30 fps 单帧 30–37 ms（预算 33.3）、20 fps 单帧
+            // 46–48 ms（预算 50）——占用都是 92–100 %。按单帧比，20→30 永远"装不下"，
+            // 按占用比才是同一件事。
+            let tile_duty = {
+                let ms = last_stats.elapsed().as_millis() as f64;
+                if ms >= 200.0 {
+                    (win_enc_us as f64 / 1000.0) / ms
+                } else {
+                    f64::NAN
+                }
+            };
             // 管线内部的分段计时按窗口取增量：每帧平均花多少 µs 在差分上、多少在编码+打包上
             let st = pipeline.as_ref().map(|p| p.stats);
             if let Some(s) = st {
@@ -1825,21 +1878,8 @@ pub async fn run(
                         // set_budget_bps 那次调用里的图块通路预算。日志要说"做了什么"，
                         // 不能说"应压制"——那副模样好像执行器还没接上。
                         //
-                        // 但升档不能只是"不动"：图块阶段或编码器算力受限期把上限压下来
-                        // 之后，链路回升的每一步都要把上限往上还（只升不降），否则那个
-                        // 低帧率会一直留到下一次交接。
-                        if step == Step::Up && (vmode || pending) {
-                            let want = ((fps_ceil as u64 * gov.settings().fps as u64)
-                                / gov.top_fps() as u64)
-                                .clamp(1, fps_ceil as u64) as u32;
-                            let cur = fps_ctl.load(Ordering::Relaxed);
-                            if want > cur {
-                                fps_ctl.store(want, Ordering::Relaxed);
-                                emit(Event::Log(format!(
-                                    "视频平面帧率上限回升 {cur} → {want} fps"
-                                )));
-                            }
-                        }
+                        // 回升不在这里做：能不能把上限还给用户，取决于这条管线每秒
+                        // 还剩多少算力（下面的占用闸门）。这里只报告阶梯位置。
                         emit(Event::Log(format!(
                             "守门员：{}（{why}）→ 图块预算 {}，帧率保持 {} fps",
                             if step == Step::Down { "链路收紧" } else { "链路回升" },
@@ -1850,16 +1890,28 @@ pub async fn run(
                             },
                             fps_ctl.load(Ordering::Relaxed)
                         )));
-                    } else {
+                    } else if step == Step::Down {
                         // 阶梯按用户上限等比缩放：Text 阶梯 15/10/5/2 配 30 fps 上限
                         // 就是 30/20/10/4，降完还能回到用户要的那一档
-                        let want = ((fps_ceil as u64 * gov.settings().fps as u64)
-                            / gov.top_fps() as u64)
-                            .clamp(1, fps_ceil as u64) as u32;
+                        let want = governed_fps(&gov, fps_ceil);
                         fps_ctl.store(want, Ordering::Relaxed);
                         emit(Event::Log(format!(
-                            "守门员：{}（{why} → {want} fps）",
-                            if step == Step::Down { "降级" } else { "回升" }
+                            "守门员：降级（{why} → {want} fps）"
+                        )));
+                    }
+                }
+                // 回升不在阶梯事件里做：图块通路的算力是**每秒**账（见 tile_duty），
+                // 只有当下真的有 20 % 余量才把帧率还回去。每个观测拍子都评估，
+                // 而不是只在 Step::Up 那一刻——阶梯走到顶以后就不会再有 Up 事件，
+                // 那时内容变轻了也要能把帧率还回来。
+                if !vmode && !pending && tile_duty.is_finite() && tile_duty <= 0.8 {
+                    let want = governed_fps(&gov, fps_ceil);
+                    let cur = fps_ctl.load(Ordering::Relaxed);
+                    if want > cur {
+                        fps_ctl.store(want, Ordering::Relaxed);
+                        emit(Event::Log(format!(
+                            "帧率上限回升 {cur} → {want} fps（图块占用 {:.0}% ≤ 80%）",
+                            tile_duty * 100.0
                         )));
                     }
                 }
