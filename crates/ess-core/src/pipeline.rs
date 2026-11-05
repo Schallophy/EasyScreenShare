@@ -783,13 +783,29 @@ impl<'c> SendPipeline<'c> {
                 // 还在大改就继续由媒体通道出画，回到小改动/静止就退回无损、交给帧率控制器。
                 let tiles = self.grid.tile_count().max(1) as f32;
                 let fresh_ratio = fresh as f32 / tiles;
-                // 续期仍按"这一秒的新变化还装不装得下"判（换用进入时那次的量就会永不退出），
-                // 不额外加变化量门槛：进入侧已经有门槛了，光标级别的更新把平面翻不回来，
-                // 而按窗口判能保住这一秒的迟滞，避免"拖动中一顿"就进出一次。
+                // 续期只看**当前这一秒的新变化**还值不值得留在有损平面。
+                //
+                // 旧写法在这里无条件续期 `receiver_strain`。它是"观看端此刻啃不啃得动"
+                // 的实时信号，但**平面期内根本采样不到**：会话在运动/平面期间直接丢弃
+                // 观看端报告（`ess-session/src/lib.rs:1472`，`motion_active()` 且
+                // `layout_id != 0` 就 continue，避免逐块补发去抢媒体通道的带宽），于是
+                // 它冻结在"进入平面之前"那次报告的值上（true）。无条件续期的结果：
+                // 静止画面也永远退不回图块。真机复现（2026-11-05，720p + 慢观看端，
+                // `scripts` 同款方式）：4.2 s 由 strain 逼进平面、13 s 画面静止，旧写法
+                // 到 28 s 仍停在平面（末端 `strain=true`），终帧与期望帧不一致。
+                //
+                // 同一条 `||` 里的 `encode_pressure` 在平面期内恒为 false——会话每个心跳
+                // 都调 `set_encode_pressure`，而它的写法是 `on && !video_mode`（见上面
+                // 的同名方法），进平面就被清零。所以移除它只是清理死条件，不改变行为：
+                // 编码逼进来的平面靠**进入归因** `encode_plane` 续期，那一项与它配套的
+                // `fresh_ratio` 门槛旧写法就有。
+                //
+                // 现在：预算仍然装不下 → 留；编码/落后逼进来的平面 → 只有当前变化量还大
+                // 才留。画面一静止，`fresh_ratio` 掉到门槛以下，迟滞走完就退回无损
+                // （实测：同一场景退出发生在静止后 0.37 s，终帧与期望帧逐字节一致）。
                 if !self.budget_room(demand_now)
-                    || self.encode_pressure
-                    || self.receiver_strain
-                    || (self.encode_plane && fresh_ratio >= self.encode_plane_min_ratio)
+                    || ((self.encode_plane || self.receiver_strain)
+                        && fresh_ratio >= self.encode_plane_min_ratio)
                 {
                     self.motion_hold = self.hold_frames;
                 }

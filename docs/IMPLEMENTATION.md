@@ -3128,6 +3128,14 @@ dxgi 94 / gdi 71 是单轮，落在 ±10 ms 的跑间噪声里，我不拿它当
 
 回归：`a_late_full_frame_does_not_clobber_newer_tiles`。
 
+**静止画面卡在视频平面（同日发现）**。观看端报告修好之后，现场出现"画面静止但一直不回图块"：`视频平面进入` 之后 120 s 没有退出，发送端 `tiles` 计数原地不动、`frames` 照涨。根因在平面续期条件里的 `receiver_strain`：它是"观看端此刻啃不啃得动"的实时信号，可平面期内根本采样不到——会话在运动/平面期间直接丢弃观看端报告（`ess-session/src/lib.rs:1472`，`motion_active()` 且 `layout_id != 0` 就 continue，免得逐块补发去抢媒体通道），于是它冻结在进入平面之前那次报告的值上（`true`）。无条件续期 → 静止后永远退不出去。
+
+同一条 `||` 里的 `encode_pressure` 则是**死条件**：会话每个心跳都调 `set_encode_pressure`，而它的写法是 `on && !video_mode`（`pipeline.rs:373`），进平面就被清零，所以平面期内它恒为 false。移除它不改变行为；编码逼进来的平面靠**进入归因** `encode_plane` 续期，配套的 `fresh_ratio` 门槛旧写法就有。
+
+修法：续期只看**当前这一秒的新变化**——预算仍然装不下就留；编码/落后逼进来的平面，只有 `fresh_ratio ≥ encode_plane_min_ratio` 才续期。
+
+真机 A/B（720p 合成屏，每块忙等 1500 µs 的观看端，`ESS_MOTION=0` 让平面只能由 strain 逼进，前面留 3 s 静止让观看端先跟上一次——`strain` 只在"跟上过"之后才计数）：两版都在 4.23 s 由 strain 进入平面，画面 13 s 静止；修复版 13.37 s 退出、终帧与期望帧逐字节一致，旧版到 28 s 仍停在平面（末端 `strain=true`）、终帧不一致。回归：`a_strain_plane_returns_to_lossless_when_the_picture_settles`（生产现场这条）、`an_encode_plane_returns_to_lossless_when_the_picture_settles`（锁进入归因那条，标志只能直接注入）。
+
 **浏览器状态报告一直没发出去（同日发现，第三轮修复的前置缺陷）**。做观看端界面改造时，控制台第一条错误是 `TypeError: Cannot convert 1793884518996 to a BigInt`。`ess_viewer_report` 的 `now_ms` 在 Rust 侧是 `u64`、wasm 里是 i64 形参，JS 必须传 `BigInt`；原代码传的是 `Date.now()`（Number），于是 `sendReport` 每 500 ms 抛一次、**一条状态报告都没发出去**。后果是发送端永远收不到观看端的版本向量：第三轮的"报告按块补"、脱落补账、`layout=0` 请求整帧在浏览器端**实际上从未执行**，手机上的残留只能等下一次内容变化或整帧。改成 `BigInt(Date.now())` 后报告恢复；这也解释了为什么第三轮的改动在浏览器上看起来没有效果（原生观看端走 Rust 侧，不受影响）。以后所有 `u64` 导出一律按 BigInt 传，验收脚本会直接读 `window.__ess.state.msgs` 与发送端的报告计数做对照。
 
 

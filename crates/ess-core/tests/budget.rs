@@ -324,6 +324,91 @@ fn settled_picture_returns_to_lossless_even_while_budget_stays_tight() {
     assert_eq!(p.budget_bps(), 8_000, "预算本来就没放松，回退只能是因为画面静止");
 }
 
+/// 编码压力逼进的平面，画面静止后也必须退回无损。
+///
+/// 这条锁的是**进入归因**那条路：平面由 `by_encode` 抬起后，续期只认 `encode_plane`
+/// 归因（面板期内的实时信号都采样不到），画面静止就必须退出。
+///
+/// 注意它**不是**生产现场的那条（生产现场由下面 strain 那条复现）：会话每个心跳都调
+/// `set_encode_pressure`，写法是 `on && !video_mode`，进平面后 `encode_pressure`
+/// 立刻被清零——所以生产里不可能出现"encode_pressure 冻结在 true"。测试只能直接注入
+/// 这个标志来构造归因，再用"钉住不放"确认续期不看它。
+#[test]
+fn an_encode_plane_returns_to_lossless_when_the_picture_settles() {
+    let mut p = sender();
+    let f0 = noise(0, 128, 128);
+    p.on_frame(&f0).unwrap();
+    p.set_encode_pressure(true);
+
+    let mut moving = f0.clone();
+    moving.ts_us = 100_000;
+    edit(&mut moving, 5, 5); // 128x128 = 4 块，改 1 块 = 25% → 过 plane_worthy
+    let k = kinds(&p.on_frame(&moving).unwrap());
+    assert!(k.contains(&"video-on"), "编码压力应把画面交给媒体通道: {k:?}");
+
+    // 从此画面不再变化；`encode_pressure` 直接注入了就不动它，看续期认不认这个标志
+    let mut exit = None;
+    for i in 2..20u32 {
+        let mut f = moving.clone();
+        f.ts_us = i as u64 * 100_000;
+        let k = kinds(&p.on_frame(&f).unwrap());
+        if k.contains(&"video-off") {
+            exit = Some(k);
+            break;
+        }
+    }
+    let k = exit.expect("画面静止后仍赖在视频平面上（encode_pressure 冻结的旧缺陷回来了）");
+    let off = k.iter().position(|x| *x == "video-off").unwrap();
+    assert!(
+        k[..off].contains(&"repair") || k[..off].contains(&"full"),
+        "video-off 之前必须先发修复批次: {k:?}"
+    );
+    assert!(!p.video_mode());
+}
+
+/// 观看端落后（strain）逼进的平面：**这条是生产现场那一条**。
+///
+/// 平面期内会话直接丢弃观看端报告（`ess-session/src/lib.rs:1472`），`receiver_strain`
+/// 于是冻结在"进入平面之前"那次报告的值上（true）。旧写法无条件用它续期，静止画面
+/// 就永远退不回图块——2026-11-05 现场：`视频平面进入` 之后 120 s 无退出，`tiles` 计数
+/// 原地不动、`frames` 照涨。
+///
+/// 真机 A/B（720p 合成屏 + 每块忙等 1500 µs 的观看端，`ESS_MOTION=0` 让平面只能由
+/// strain 逼进，静止前导 3 s 让观看端先跟上一次）：两版都在 4.23 s 进入；
+/// 画面 13 s 静止后，修复版 13.37 s 退出且终帧逐字节一致，旧版到 28 s 仍停在平面、
+/// 终帧不一致。
+#[test]
+fn a_strain_plane_returns_to_lossless_when_the_picture_settles() {
+    let mut p = sender();
+    let f0 = noise(0, 128, 128);
+    p.on_frame(&f0).unwrap();
+    p.receiver_strain = true;
+
+    let mut moving = f0.clone();
+    moving.ts_us = 100_000;
+    edit(&mut moving, 5, 5);
+    let k = kinds(&p.on_frame(&moving).unwrap());
+    assert!(k.contains(&"video-on"), "strain 应把画面交给媒体通道: {k:?}");
+
+    let mut exit = None;
+    for i in 2..20u32 {
+        let mut f = moving.clone();
+        f.ts_us = i as u64 * 100_000;
+        let k = kinds(&p.on_frame(&f).unwrap());
+        if k.contains(&"video-off") {
+            exit = Some(k);
+            break;
+        }
+    }
+    let k = exit.expect("画面静止后仍赖在视频平面上（receiver_strain 冻结的旧缺陷回来了）");
+    let off = k.iter().position(|x| *x == "video-off").unwrap();
+    assert!(
+        k[..off].contains(&"repair") || k[..off].contains(&"full"),
+        "video-off 之前必须先发修复批次: {k:?}"
+    );
+    assert!(!p.video_mode());
+}
+
 /// 退出平面后**再次**被预算逼进来，归因仍然是预算——即使观看端此刻也在落后。
 ///
 /// 真机 forced-plane 的形状：窄预算 → 图块通路压住 → 观看端落后（strain 成立）→
