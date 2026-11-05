@@ -83,6 +83,42 @@ fn blind(msgs: &[WireMsg]) -> (u32, Vec<u32>, Vec<u32>) {
     }).expect("没有整帧消息")
 }
 
+/// 只动一两块（光标/时钟/闪烁光标）不该因为窄预算被换到有损平面；同样的窄预算下
+/// 真正的成片变化仍然必须交出去。这条区分的是"绝对量很小"和"无损真的装不下"。
+#[test]
+fn cursor_sized_edit_stays_on_tiles_under_a_tight_budget() {
+    let mut p = sender();
+    // 512x512 = 8x8 网格：一块 = 1.6%，远低于平面门槛
+    let f0 = noise(0, 512, 512);
+    let m0 = p.on_frame(&f0).unwrap();
+    assert!(kinds(&m0).contains(&"full"), "首帧应发整帧: {:?}", kinds(&m0));
+
+    // 1 KB/s：连一次小编辑都塞不下两次
+    p.set_budget_bps(8_000);
+    let mut f1 = f0.clone();
+    f1.ts_us = 100_000;
+    edit(&mut f1, 5, 5); // 1 块 = 1.6%
+    let k1 = kinds(&p.on_frame(&f1).unwrap());
+    assert!(
+        !k1.contains(&"video-on") && !p.video_mode(),
+        "光标级别的变化不该被窄预算顶到有损平面: {k1:?}"
+    );
+    assert_eq!(p.stats.budget_forced, 0);
+
+    // 同一预算下改到 10 块（15.6%）——这次是真装不下，必须交出去
+    let mut f2 = f1.clone();
+    f2.ts_us = 200_000;
+    for i in 0..10u32 {
+        edit(&mut f2, i * 48, i * 48);
+    }
+    let k2 = kinds(&p.on_frame(&f2).unwrap());
+    assert!(
+        k2.contains(&"video-on") && p.video_mode(),
+        "成片变化在窄预算下仍该交给媒体平面: {k2:?}"
+    );
+    assert_eq!(p.stats.budget_forced, 1);
+}
+
 #[test]
 fn tight_budget_forces_media_plane_and_recovers_with_repair_first() {
     let mut p = sender();

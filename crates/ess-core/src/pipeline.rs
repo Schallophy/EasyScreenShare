@@ -766,6 +766,9 @@ impl<'c> SendPipeline<'c> {
                 // 还在大改就继续由媒体通道出画，回到小改动/静止就退回无损、交给帧率控制器。
                 let tiles = self.grid.tile_count().max(1) as f32;
                 let fresh_ratio = fresh as f32 / tiles;
+                // 续期仍按"这一秒的新变化还装不装得下"判（换用进入时那次的量就会永不退出），
+                // 不额外加变化量门槛：进入侧已经有门槛了，光标级别的更新把平面翻不回来，
+                // 而按窗口判能保住这一秒的迟滞，避免"拖动中一顿"就进出一次。
                 if !self.budget_room(demand_now)
                     || self.encode_pressure
                     || self.receiver_strain
@@ -869,13 +872,19 @@ impl<'c> SendPipeline<'c> {
         // 同一条路也走"单帧编码耗时装不下帧预算"：那种负载下降帧率只是把延迟摊平，
         // 观看端看到的仍是按序播放的旧画面；交给 H264（1080p 一帧 5–10 ms）才追得平。
         let room = self.budget_room(demand);
+        // 这一帧到底变了多少（占比）。预算/算力两条路径都要过这道门槛，见下面的
+        // `plane_worthy`；判定日志里也带上，免得下次还得从 `changed` 反推阈值。
+        let changed_ratio = diff.changed.len() as f32 / self.grid.tile_count().max(1) as f32;
+        let plane_worthy = changed_ratio >= self.encode_plane_min_ratio;
         if self.decide_log {
             // 归因出问题时唯一能看的证据：这一帧的无损需求量、预算、以及三条判据此刻
             // 各自成不成立（`forced_plane` 只有帧末累计值，看不出是谁该记账）。
             eprintln!(
-                "BUDGET ts={} changed={} demand={}KB/s budget={}KB/s room={} enc_press={} strain={} plane={}",
+                "BUDGET ts={} changed={} ratio={:.3} worthy={} demand={}KB/s budget={}KB/s room={} enc_press={} strain={} plane={}",
                 cur.ts_us / 1000,
                 diff.changed.len(),
+                changed_ratio,
+                plane_worthy,
                 demand / 1024,
                 self.budget_bps / 8 / 1024,
                 room,
@@ -899,11 +908,17 @@ impl<'c> SendPipeline<'c> {
         // 不由谁先说话决定。
         let loss_forces = self.loss_needs_plane;
         self.loss_needs_plane = false;
-        // 算力路径也要看这一帧到底变了多少：只动一两块（光标、一行字）就切到有损平面，
-        // 付出的清晰度代价远大于省下的编码时间——这种量级交给帧率/尺寸控制器消化。
-        let changed_ratio = diff.changed.len() as f32 / self.grid.tile_count().max(1) as f32;
-        let by_budget = !room || loss_forces;
-        let by_encode = room && self.encode_pressure && changed_ratio >= self.encode_plane_min_ratio;
+        // **预算路径同样要看变化量**（`plane_worthy` 是上面按这一帧算好的占比）。
+        // 手机链路上拥塞时预算被压到 200 kbps 兜底，而 1080p 桌面上哪怕只有光标/
+        // 时钟/闪烁光标在动（每秒几十块）折算下来也会超过它；旧写法 `!room` 一成立
+        // 就切有损平面，于是"只动鼠标"甚至"画面看着没动"都会切过去，退出补帧又把
+        // 队列顶出一次拥塞，来回抖。这种绝对量很小的更新错过一两条本就会由 500 ms
+        // 状态报告补回，不该拿清晰度去换。算力路径同理：只动一两块（光标、一行字）
+        // 就切到有损平面，付出的清晰度代价远大于省下的编码时间——这种量级交给
+        // 帧率/尺寸控制器消化。
+        // `loss_forces` 是正确性缺口（补账装不下），不受这条门槛约束。
+        let by_budget = (!room && plane_worthy) || loss_forces;
+        let by_encode = room && self.encode_pressure && plane_worthy;
         let by_strain = room && !self.encode_pressure && self.receiver_strain;
         if self.video_plane
             && (!diff.changed.is_empty() || loss_forces)
