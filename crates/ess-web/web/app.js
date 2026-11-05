@@ -184,15 +184,89 @@ function shedUpdate(feedDelta, drawDelta) {
   else if (shedOn && duty < SHED_OFF) shedOn = false;
 }
 
+// ── 传输速率（详情面板） ───────────────────────────────────────────────────
+// 速率只能从 WebRTC 的 getStats 读，而 LiveKit 的 umd 不导出它，SDK 内部字段名又会
+// 随版本变（#60 的探针就是这么失效的）。所以在 SDK 之下包一层构造函数，把它自己建
+// 的 RTCPeerConnection 收进来——只读 getStats 里的标准字段，与 SDK 版本无关。
+// livekit 只在运行时 `new RTCPeerConnection(...)`、没有缓存构造函数（umd 里就那么一
+// 处），所以在本文件（脚本顺序在它之后）替换依然生效。
+const peerConns = [];
+if (typeof window.RTCPeerConnection === 'function' && typeof Proxy === 'function') {
+  window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
+    construct(target, args, newTarget) {
+      const pc = Reflect.construct(target, args, newTarget);
+      peerConns.push(pc);
+      return pc;
+    },
+  });
+}
+
+// 数据通道（图块更新 / 状态报告）的字节由自己数：WebRTC 的 stats 只有 RTP 的收发
+// 字节，没有 SCTP 应用消息的计数。两条通路分开报，才看得出"贵的是画面还是媒体"。
+let tilesRx = 0, tilesTx = 0;
+const net = { down: 0, up: 0, tiles: 0, media: 0 };    // bit/s
+let netAt = 0, netMedia = 0, netRx = 0, netTx = 0;     // 上一次采样的基线（累计字节）
+let netBusy = false;
+
+function fmtRate(bps) {
+  if (!(bps > 0)) return '0 bps';   // 带单位：详情里"图块 0"会被读成一个计数而非速率
+  if (bps < 1e3) return `${Math.round(bps)} bps`;
+  if (bps < 1e6) return `${bps < 1e5 ? (bps / 1e3).toFixed(1) : Math.round(bps / 1e3)} kbps`;
+  return `${(bps / 1e6).toFixed(2)} Mbps`;
+}
+
+// 1 s 一拍，全部用累计字节做差分：这样对丢包/重传不敏感——要的是"链路上真实的
+// 字节流速"，不是应用层有效载荷。
+async function pumpNet() {
+  if (netBusy) return;
+  netBusy = true;
+  const now = performance.now();
+  let media = 0, seen = false;
+  for (let i = peerConns.length - 1; i >= 0; i--) {
+    const pc = peerConns[i];
+    if (pc.signalingState === 'closed') { peerConns.splice(i, 1); continue; }
+    try {
+      const report = await pc.getStats();
+      report.forEach((r) => {
+        if (r.type === 'inbound-rtp' && typeof r.bytesReceived === 'number') media += r.bytesReceived;
+      });
+      seen = true;
+    } catch (e) { /* 连接正在拆：这一拍跳过，别把异常当成 0 速率 */ }
+  }
+  netBusy = false;
+  if (!seen) return;
+  const dt = (now - netAt) / 1000;
+  // 重连会换一对 pc，计数器从头开始。总量变小就只更新基线，否则会报一个假的负速率。
+  if (netAt && dt > 0.2 && media >= netMedia) {
+    const m = (media - netMedia) / dt;
+    const t = Math.max(0, tilesRx - netRx) / dt;
+    const u = Math.max(0, tilesTx - netTx) / dt;
+    // 半衰平滑：1 s 窗口本身够短，不平滑的话读数每秒跳一次，看不出趋势
+    net.media = net.media ? net.media * 0.5 + m * 0.5 : m;
+    net.tiles = net.tiles ? net.tiles * 0.5 + t * 0.5 : t;
+    net.up = net.up ? net.up * 0.5 + u * 0.5 : u;
+    net.down = net.tiles + net.media;
+  }
+  netAt = now; netMedia = media; netRx = tilesRx; netTx = tilesTx;
+  hud.textContent = hudText();
+}
+
 function hudText() {
   const s = connected ? '已连接' : '连接中…';
   const rate = fps > 0 ? `${fps} fps` : '静止';
   const plane = videoOn ? (vTrack ? '视频轨' : '视频(等待轨道)') : '图块';
   const snd = aTrack ? (soundMuted ? '声音:关' : '声音:开') : '声音:无';
+  // 速率单独占一行：它每秒才变一次，混进状态行会把别的读数挤得对不齐。
+  // 第一次采样完成（netAt 非 0）之前不显示，免得连接前挂一排 0。
+  const flow = netAt
+    ? `\n下行 ${fmtRate(net.down)}（图块 ${fmtRate(net.tiles)} · 媒体 ${fmtRate(net.media)}）` +
+      `  上行 ${fmtRate(net.up)}`
+    : '';
   return `${s}  ${state.w}x${state.h}  ${plane}  ${rate}  ${snd}  msgs=${state.msgs}` +
     (state.dropped ? ` 丢=${state.dropped}` : '') +
     (state.loss ? ` 漏=${state.loss}` : '') +
     (shedOn ? ` 解码${Math.round(state.duty * 100)}%` : '') +
+    flow +
     (lastError ? `\n${lastError}` : '');
 }
 
@@ -547,7 +621,7 @@ function paintSoundBtn() {
 }
 
 async function loadWasm() {
-  const url = 'ess_web.wasm?v=20261105c';
+  const url = 'ess_web.wasm?v=20261105d';
   let inst;
   try {
     inst = await WebAssembly.instantiateStreaming(fetch(url), {});
@@ -749,6 +823,7 @@ function tick() {
   // 序列空洞（diag 末槽）：没按序到达的发送端消息数。口径要说清——本地 shed 闸门挡下的
   // 消息同样不会进 wasm，所以这个数含「链路丢」与「本机解码闸门丢」两部分；闸门关掉
   // （平时 duty 不高）时它就等于链路丢的量。与 丢=（只数本机闸门）分开看。
+  pumpNet();   // 异步：采完自己刷 HUD，这里不 await（它比一次 1 s 节拍慢不了）
   hud.textContent = hudText();
   updateStatus();
 }
@@ -785,6 +860,9 @@ async function main() {
   const room = new Room({ adaptiveStream: false, dynacast: false });
   room.on(RoomEvent.DataReceived, (payload, kind) => {
     const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+    // 速率按**到达**算，所以在闸门之前累计：被本机丢掉的过时内容同样吃掉了链路带宽，
+    // 详情里的下行不该因为"我没来得及解"而显得很省。
+    tilesRx += bytes.length;
     // 闸门开着时只处理不可靠通路的**最新一帧**：它们是"某一帧的局部"，过时就没有
     // 价值；可靠通路是画布正确性的依据，任何时候都得解。
     if (shedOn && kind !== RELIABLE) {
@@ -930,6 +1008,7 @@ async function main() {
       gapsReported = state.loss;
       state.reports++;
       const bytes = new Uint8Array(mem.buffer, reportPtr, n).slice();
+      tilesTx += bytes.length;
       room.localParticipant.publishData(bytes, { reliable: true }).catch((e) => {
         lastError = '报告发送失败: ' + e.message;
       });
@@ -1010,6 +1089,14 @@ async function main() {
       shedPinned = false;
     },
     videoFrames: videoFramesTotal,
+    // 传输速率的读数与累计量（自动化验收用）：bps 是平滑后的显示值，
+    // rx/tx 是数据通道的累计字节，media 是 RTP 的累计字节。
+    net: () => ({
+      down: net.down, up: net.up, tiles: net.tiles, media: net.media,
+      rx: tilesRx, tx: tilesTx, pc: peerConns.length,
+    }),
+    // 明细：验收时要能核对"媒体"这一路统计的是哪条 RTP、多少分辨率
+    netPeers: () => peerConns.slice(),
     diag() {
       if (!diagPtr) return [];
       const n = ex.ess_viewer_diag(viewer, diagPtr, 32);
