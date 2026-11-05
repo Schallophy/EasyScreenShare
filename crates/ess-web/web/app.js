@@ -42,11 +42,17 @@ const state = { msgs: 0, errors: 0, w: 0, h: 0, serial: 0, feed_ms: 0, feed_n: 0
 // （整帧基线、滚动宣告、精确修复、状态报告）一条不丢。丢了不漏画：每 500 ms 的状态
 // 报告会让发送端按**当前**画面把缺口补回来。
 //
-// 闸门开着时**限流到"每帧一条最新的"**，不是整段丢弃。全丢在真机上的表现是画布整秒
+// 闸门开着时**限流到"最新一帧"**，不是整段丢弃。全丢在真机上的表现是画布整秒
 // 冻结、然后成串补上（1920x1080 + 8× 降频实测逐秒代数 0/11 交替、2 个整秒冻屏），
-// 那正是用户报的"不追最新内容"；信箱只留最新一条则把"停走"变成"降帧"，队列深度恒
-// ≤1，积压不可能再长起来。
+// 那正是用户报的"不追最新内容"；信箱只留最新一帧则把"停走"变成"降帧"，队列深度恒
+// ≤1 帧，积压不可能再长起来。
+//
+// **"一帧"不是"一条消息"**：发送端的 `split_update` 会把一次逐块更新按 60 KB 拆成
+// 十几条消息，它们共享同一个 seq。只留最后一条等于把一帧的其余拆件全丢掉——变化的
+// 块只上屏了最后几个，其余停在旧内容（用户报的"帧率一高就有图块残留"），报告重补
+// 回来的块也会被同样丢掉。所以信箱按 seq 分组，整组保留、整组替换。
 let shedOn = false;
+/** 最新一帧：{ seq, parts: Uint8Array[] }；`seq` 相同 = 同一次更新的拆件 */
 let shedMailbox = null;
 // 自动化验收用的手动钉住：真机手机上"解码跟不上"要等得到，测试里直接钉住开/关，
 // 量的是闸门本身的行为（丢不可靠、留可靠、画布仍然收敛）。
@@ -54,6 +60,97 @@ let shedPinned = false;
 const SHED_ON = 0.45, SHED_OFF = 0.30;
 let dutyWinStart = performance.now(), dutyWinFeed = 0, dutyWinDraw = 0;
 const RELIABLE = (LivekitClient.DataPacket_Kind && LivekitClient.DataPacket_Kind.RELIABLE) || 0;
+
+// 只从线格式里取 seq：Envelope{ body = field N (len) } → body.hdr (field 1, len) →
+// Header.seq (field 1, varint)。只读几个字节，不替代 wasm 的判定；拆件要按 seq 分组，
+// JS 侧必须先认得出"这两条是同一帧的"。
+function readVarint(b, i) {
+  let v = 0, shift = 0;
+  for (;;) {
+    if (i >= b.length || shift > 35) return null;
+    const c = b[i++];
+    v += (c & 0x7f) * 2 ** shift; // 用乘法而不是移位：seq 是 u32，移位会落进有符号 32 位
+    if ((c & 0x80) === 0) return [v >>> 0, i];
+    shift += 7;
+  }
+}
+
+function skipField(b, i, wt) {
+  if (wt === 0) {
+    const r = readVarint(b, i);
+    return r ? r[1] : -1;
+  }
+  if (wt === 1) return i + 8 <= b.length ? i + 8 : -1;
+  if (wt === 2) {
+    const r = readVarint(b, i);
+    if (!r) return -1;
+    const end = r[1] + r[0];
+    return end <= b.length ? end : -1;
+  }
+  if (wt === 5) return i + 4 <= b.length ? i + 4 : -1;
+  return -1;
+}
+
+function msgSeq(b) {
+  try {
+    let r = readVarint(b, 0);
+    if (!r || (r[0] & 7) !== 2) return -1;
+    let i = r[1];
+    r = readVarint(b, i);
+    if (!r) return -1;
+    i = r[1];
+    const end = Math.min(b.length, i + r[0]);
+    // body 里 hdr 不一定是第一个字段，扫到 field 1 为止
+    while (i < end) {
+      r = readVarint(b, i);
+      if (!r) return -1;
+      i = r[1];
+      const field = r[0] >>> 3, wt = r[0] & 7;
+      if (field === 1 && wt === 2) {
+        r = readVarint(b, i);
+        if (!r) return -1;
+        i = r[1];
+        const hend = Math.min(end, i + r[0]);
+        while (i < hend) {
+          r = readVarint(b, i);
+          if (!r) return -1;
+          i = r[1];
+          if (r[0] === 0x08) return (readVarint(b, i) || [-1])[0];
+          i = skipField(b, i, r[0] & 7);
+          if (i < 0) return -1;
+        }
+        return -1;
+      }
+      i = skipField(b, i, wt);
+      if (i < 0) return -1;
+    }
+  } catch (e) {
+    return -1;
+  }
+  return -1;
+}
+
+// 不可靠消息进信箱：同一 seq 的拆件全部留下，更新的 seq 一到就整组替换。
+function shedPush(bytes) {
+  const seq = msgSeq(bytes);
+  // 认不出 seq（理论上只有控制消息会这样，而它们走可靠通路、根本到不了这里）：
+  // 宁可立刻解，也不要吞掉一帧内容。
+  if (seq < 0) {
+    feed(bytes);
+    return;
+  }
+  if (shedMailbox && seq < shedMailbox.seq) {
+    state.dropped++; // 迟到的旧帧
+    return;
+  }
+  if (shedMailbox && seq === shedMailbox.seq) {
+    shedMailbox.parts.push(bytes);
+    return;
+  }
+  // 更新的一帧：整组替换。旧组里每一条都是过时的局部内容。
+  if (shedMailbox) state.dropped += shedMailbox.parts.length;
+  shedMailbox = { seq, parts: [bytes] };
+}
 
 function shedUpdate(feedDelta, drawDelta) {
   dutyWinFeed += feedDelta;
@@ -282,12 +379,13 @@ function tick() {
 
 function loop() {
   syncPlane();
-  // 闸门信箱在每帧开头解开：一次只解一条最新的，画布每帧都有新内容，队列深度恒 ≤1。
-  // 放在 draw 之前，这一条最新更新就跟着本次上屏画出去。
+  // 闸门信箱在每帧开头解开：一次只解最新**一帧**（同一 seq 的所有拆件），画布每帧
+  // 都有新内容，队列深度恒 ≤1 帧。放在 draw 之前，这一帧的新内容就跟着本次上屏画出去。
+  // 只解最后一条会把一帧的其余拆件丢掉——那正是"图块残留"的来源。
   if (shedMailbox) {
-    const pending = shedMailbox;
+    const parts = shedMailbox.parts;
     shedMailbox = null;
-    feed(pending);
+    for (const p of parts) feed(p);
   }
   // t0 在信箱解开之后：feed 自己已经按毫秒计入 duty，从这里再包一份会把同一段
   // 工时数两遍——闸门开着时几乎每条更新都走信箱，于是 duty 被系统性抬高，闸门
@@ -309,12 +407,10 @@ async function main() {
   const room = new Room({ adaptiveStream: false, dynacast: false });
   room.on(RoomEvent.DataReceived, (payload, kind) => {
     const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
-    // 闸门开着时只处理不可靠通路的**最新一条**：它们是"某一帧的局部"，过时就没有价值；
-    // 可靠通路是画布正确性的依据，任何时候都得解。
+    // 闸门开着时只处理不可靠通路的**最新一帧**：它们是"某一帧的局部"，过时就没有
+    // 价值；可靠通路是画布正确性的依据，任何时候都得解。
     if (shedOn && kind !== RELIABLE) {
-      // 信箱里那条被这条取代——丢的是过时的，留的是最新的
-      if (shedMailbox) state.dropped++;
-      shedMailbox = bytes;
+      shedPush(bytes);
       return;
     }
     feed(bytes);
