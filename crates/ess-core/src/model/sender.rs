@@ -308,6 +308,16 @@ impl Sender {
         self.strain_run >= 2
     }
 
+    /// 画布要被重建（新观看方加入 / 重连 / 请求整帧）时，把能力基线一并清掉。
+    ///
+    /// "曾经跟上过"是对**某一块画布**的证明。整帧意味着那块画布不再作数：新观看端
+    /// 从零开始，它第一秒的落后和当初冷启动那次一样没有基线。不清掉，重连后的手机
+    /// 会继承上一个观看端的基线，一秒内就被判成"啃不动"，画面被交给窄媒体轨道。
+    pub fn forget_baseline(&mut self) {
+        self.ever_current = false;
+        self.strain_run = 0;
+    }
+
     fn receiver_strain_raw(&self, tiles: usize, behind: usize) -> bool {
         tiles >= 16 && behind * 100 >= tiles * 25
     }

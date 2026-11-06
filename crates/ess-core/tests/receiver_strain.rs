@@ -250,6 +250,29 @@ fn a_report_that_lands_before_the_first_block_is_not_a_baseline() {
 }
 
 #[test]
+fn a_joining_viewer_does_not_inherit_the_previous_baseline() {
+    // 会话只有一条管线，观看端重连（切网、刷新页面）走的是 `force_full`：整帧重建画布。
+    // 基线如果留着，新观看端就从上一块画布那里继承了"曾经跟上"，重连后的第一秒——
+    // 整帧还在路上、报告里全是 0——会被判成"啃不动"，画面立刻被交给窄媒体轨道。
+    let mut p = sender(true);
+    for k in 1..4 {
+        p.on_frame(&noise(k, 512, 512)).unwrap();
+    }
+    let (v, e, id) = (p.ctl.version.clone(), p.ctl.epoch.clone(), p.ctl.layout_id);
+    p.on_report(id, &v, &e, 1_000).unwrap();
+    assert!(p.ctl.ever_current, "前置条件：老观看端曾经跟上过");
+
+    p.force_full();
+    assert!(!p.ctl.ever_current, "整帧重建后基线要重新挣");
+
+    let (id2, zero) = (p.ctl.layout_id, vec![0u32; p.ctl.version.len()]);
+    for t in 0..3 {
+        p.on_report(id2, &zero, &zero, 2_000 + t * 500).unwrap();
+    }
+    assert!(!p.receiver_strain, "重连后第一秒的落后不是能力证据");
+}
+
+#[test]
 fn reports_during_the_plane_do_not_latch_strain() {
     // 平面期间发送端本来就不发图块，观看端的版本当然停在原地。把它读成"跟不上"会让
     // 平面永远退不出来（实测 forced-plane：画面静止后仍留在有损平面，终帧逐字节不一致）。
