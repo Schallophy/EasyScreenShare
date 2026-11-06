@@ -223,6 +223,33 @@ fn a_client_that_never_caught_up_is_not_capability_evidence() {
 }
 
 #[test]
+fn a_report_that_lands_before_the_first_block_is_not_a_baseline() {
+    // 真机顺序：观看端先连上、发送端隔一秒才起。这中间送到的那份报告里，观看端版本是 0，
+    // 发送端的版本**也还是 0**——差集天然为空，而"空差集 = 跟上了"会把基线立成真。
+    // 基线一假，整帧还在路上的那几份报告（`missing=240`）就被读成"啃不动"，冷启动第一秒
+    // 把画面交给被压到 300 kbps 的轨道（编码器自己降到 384x216），而那正是 §14.7.4 想挡的。
+    let mut p = sender(false);
+    let (id, zero) = (p.ctl.layout_id, vec![0u32; p.ctl.version.len()]);
+    p.on_report(id, &zero, &zero, 0).unwrap();
+    assert!(!p.ctl.ever_current, "还没发过任何块时的空差集不是基线");
+
+    // 发送端开始出帧，观看端一块都还没落——这几份报告不许变成能力证据。
+    for k in 1..4 {
+        p.on_frame(&noise(k, 512, 512)).unwrap();
+    }
+    for t in 0..4 {
+        p.on_report(id, &zero, &zero, 500 + t * 500).unwrap();
+    }
+    assert!(!p.ctl.ever_current, "落后报告不会反向建立基线");
+    assert!(!p.receiver_strain, "整帧还在路上时不许判成啃不动");
+
+    // 真正跟上一次以后，基线才成立（后续落后才算证据）。
+    let (v, e, id2) = (p.ctl.version.clone(), p.ctl.epoch.clone(), p.ctl.layout_id);
+    p.on_report(id2, &v, &e, 3_000).unwrap();
+    assert!(p.ctl.ever_current, "见过一次完全跟上才立基线");
+}
+
+#[test]
 fn reports_during_the_plane_do_not_latch_strain() {
     // 平面期间发送端本来就不发图块，观看端的版本当然停在原地。把它读成"跟不上"会让
     // 平面永远退不出来（实测 forced-plane：画面静止后仍留在有损平面，终帧逐字节不一致）。
