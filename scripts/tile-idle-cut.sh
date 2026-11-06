@@ -14,7 +14,7 @@
 #   1. vstop 单调涨到 ≥1 s      —— 停喂真的发生了（不是被别的路径挡住）
 #   2. 停喂窗口内 vsent=0 且 egress ≈ 0  —— 省下来的确实是上行，不是只改了计数器
 #   3. 动画开始后 vstop 归零、vsent>0     —— 停喂是可逆的，编码器冷启动能起来
-#   4. 终帧逐字节等于期望       —— 冷启动不是拿一张旧画面糊过去
+#   4. 终帧逐字节等于期望       —— 冷启动不是拿一张旧画面糊过去，退出修复没漏块
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=target/release
@@ -73,7 +73,9 @@ for l in t.splitlines():
         try: return l.split(k + '=')[1].split()[0]
         except Exception: return None
     stats.append({'vstop': float(g('vstop') or 0), 'vsent': float(g('vsent') or 0),
-                  'egress': g('egress'), 'audio': g('audio'), 'enc': g('enc'), 'raw': l})
+                  'egress': g('egress'), 'audio': g('audio'), 'enc': g('enc'),
+                  # `updates` 是累计条数：它一变就说明画面又开始动了，停喂窗口到此为止
+                  'updates': int(g('updates') or 0), 'raw': l})
 planes = []
 for l in t.splitlines():
     if 'DECIDE ts=' in l:
@@ -111,10 +113,16 @@ if stopped:
         print('  PASS 停喂窗口内 vsent=0（编码器确实没在出帧）')
     # `egress` 是平滑过的读数，停喂后要几秒才掉下来（实测 0.11→0.06→0.02 用 4 s）。
     # 所以拿**窗口末行**跟停喂前的基线比，而不是要求整段立刻归零。
+    # 窗口要**先把"画面又开始动"的那一秒切掉**再判：`vstop` 按整秒取整，动画开始的
+    # 那一行 `vstop` 还 ≥1，但图块已经在往外发了（实测那一行 0.32 Mbps、`vsent` 仍是 0，
+    # 判据会把"恢复"读成"没降下来"）。
     idx0 = stats.index(stopped[0])
+    first_move = next((i for i in range(idx0, len(stats))
+                       if stats[i]['updates'] > stats[idx0]['updates']), len(stats))
+    idle_rows = stats[idx0:first_move] or stopped
     before = [video_kbps(s) for s in stats[max(0, idx0 - 4):idx0]]
     base = max(before) if before else 0.0
-    tail = video_kbps(stopped[-1])
+    tail = video_kbps(idle_rows[-1])
     if tail <= 40 and (base <= 0 or tail <= base * 0.4):
         print(f'  PASS 上行（扣掉声音）{base:.0f} → {tail:.0f} kbps（停喂稳定后）')
     else:
@@ -172,9 +180,10 @@ else:
     else:
         print(f'  PASS 冷启动后连续出画：{best_fps} 帧/s，间隔 p95={worst}ms max={worst_max}ms')
 
-# 终帧：**不逐字节比**。从视频平面退回图块后有一个已知残块（约 1/900 张块停在中途
-# 版本，两端账上都显示已同步），关掉本功能同样复现，与本改动无关；逐字节比会被它
-# 挡住。这里卡 MAE：整屏糊一张旧画面是几十的量级，而那个残块只贡献 0.2。
+# 终帧：**逐字节比**。退出平面的修复基线取"交接那一刻"观看端手里的画面，差集是完备的，
+# 所以退回来必须与期望帧一模一样。曾经这里只能卡 MAE——基线取的是"决定要交"那一刻的
+# 快照，而预热期还在发无损差分，退出差集于是漏掉"中途变过、又变回原样"的块，留下一个
+# 永远补不回来的残块（见 pipeline.rs 的 `refresh_exit_baseline`）。
 exp = open(out + '/expected.ppm', 'rb').read()
 try:
     got = open(out + '/received.ppm', 'rb').read()
@@ -194,10 +203,10 @@ def mae(a, b):
 m = mae(exp, got) if got else None
 if m is None:
     print(f'  FAIL 终帧读不出来（期望 {len(exp)} B / 收到 {len(got)} B）'); fail = 1
-elif m > 1.0:
-    print(f'  FAIL 终帧偏差 MAE={m:.2f}（整屏没收敛到当前画面）'); fail = 1
+elif got != exp:
+    print(f'  FAIL 终帧与期望不一致：MAE={m:.3f}（这是残块/糊旧画面的样子）'); fail = 1
 else:
-    print(f'  PASS 终帧 MAE={m:.3f}（残块之外全对，且没有糊旧画面）')
+    print('  PASS 终帧与期望逐字节一致（冷启动没糊旧画面，退出修复也没漏块）')
 
 sys.exit(fail)
 PY

@@ -170,7 +170,11 @@ fn main() {
     // `idx = ts_us/100_000`，所以 step_at 用的是 100 ms 格（90 ≈ t=9 s）。
     // 原来只按 anim 取样，带 ESS_DEMO_STEP 的夹具会拿"变化前"的画面当期望帧——
     // 实测表现为 MAE 恒定 52（半屏照片类的整块内容差），会被误读成有损糊了。
-    let ts_idx = (anim as u64 + delay + 10).max(src.step_at as u64 + 2);
+    // `--idx` 直接指定采样帧号（诊断用：判断某个残块到底停在哪一帧的内容上）
+    let ts_idx = match arg(&args, "--idx", "") {
+        s if s.is_empty() => (anim as u64 + delay + 10).max(src.step_at as u64 + 2),
+        s => s.parse().unwrap(),
+    };
     let f = src.frame(ts_idx * 100_000);
     match write_ppm(&out, &f) {
         Ok(()) => println!("wrote {out} ({}x{})", f.w, f.h),

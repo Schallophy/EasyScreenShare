@@ -486,3 +486,73 @@ fn budget_forced_entry_does_not_warm_up() {
     assert!(announced, "预算逼出来的平面一次都没交接：预热把它挡在门外了");
     assert!(!pending_seen, "预算逼进来的平面不该预热");
 }
+
+/// 一块一色的 128x128（2x2 块），用来精确控制"变了几块"。
+fn quad(ts_us: u64, colors: [u32; 4]) -> Frame {
+    let mut f = Frame::new(128, 128, ts_us);
+    for (i, &c) in colors.iter().enumerate() {
+        let (cx, cy) = ((i % 2) as u32, (i / 2) as u32);
+        for y in cy * 64..(cy + 1) * 64 {
+            for x in cx * 64..(cx + 1) * 64 {
+                let o = y as usize * f.stride + x as usize * 4;
+                f.px[o..o + 4].copy_from_slice(&c.to_le_bytes());
+            }
+        }
+    }
+    f
+}
+
+/// 退出平面的修复基线必须取**交接那一刻**观看端手里的画面，而不是"决定要交"那一刻的。
+///
+/// 预热期（已决定交、还没真交）画面仍由无损差分出：那几帧的更新会照常发出去，观看端
+/// 画布因此往前走，而 `repair_baseline` 还停在上限之前那次快照上。退出时按这份过期基线
+/// 做差分，凡是"中途变过、又变回原样"的块都会被判成"没变"——那块就永远停在预热期的
+/// 中途内容上，而且两端版本账一致（发送端只在真正发出时推进版本），报告看不出缺口。
+///
+/// 真机现场（`scripts/tile-idle-cut.sh`，1280x720）：底部一块停在动画第 5 帧的内容上，
+/// 终帧 MAE 0.128，`missing=0 behind=0`、`REPAIR` 只剩退出那一次。这里用"一块一色"把
+/// 那次巧合（周期性纹理在基线与终帧恰好同色）做成确定性用例。
+#[test]
+fn warm_up_keeps_sending_so_the_exit_baseline_is_taken_at_handover() {
+    const BASE: u32 = 0xff10_1010;
+    const MID: u32 = 0xff30_3030;
+
+    let mut p = SendPipeline::new(quad(0, [BASE; 4]), codecs());
+    p.video_plane = true;
+    p.set_warm_max_us(6_000_000);
+    let mut rx = RecvPipeline::new(codecs());
+    pump(&mut rx, &p.on_frame(&quad(33_000, [BASE; 4])).unwrap());
+    // 探针要有一帧作基准（`motion_ratio` 第一次调用只填探针，判 0）
+    pump(&mut rx, &p.on_frame(&quad(66_000, [BASE; 4])).unwrap());
+
+    // 决定要交：四块全变，预热开始；这一帧仍由无损差分出画。
+    pump(&mut rx, &p.on_frame(&quad(99_000, [MID; 4])).unwrap());
+    assert!(p.media_pending() && !p.video_mode(), "这一帧应该还在预热");
+
+    // 预热期里再变一块：同样走无损差分，观看端手里这块因此是"中途内容"。
+    let out = p.on_frame(&quad(132_000, [MID, 0xff40_4040, MID, MID])).unwrap();
+    assert!(kinds(&out).contains(&"update"), "预热期画面仍由无损差分出：{:?}", kinds(&out));
+    pump(&mut rx, &out);
+
+    // 交付达标两窗之后，下一帧仍是大面积变化 → 真正交接（这一帧只记账，不发给观看端）。
+    p.note_media_delivery(30.0, 30, 96, 96);
+    p.note_media_delivery(30.0, 30, 96, 96);
+    let out = p.on_frame(&quad(165_000, [MID, 0xff50_5050, MID, MID])).unwrap();
+    assert!(kinds(&out).contains(&"video-on"), "连续达标后应当交接：{:?}", kinds(&out));
+    assert!(p.video_mode());
+
+    // 画面回到 BASE：与"决定要交"那一帧的快照逐块相同，与观看端手里的中途内容不同。
+    let back = quad(198_000, [BASE; 4]);
+    pump(&mut rx, &p.on_frame(&back).unwrap());
+    for i in 1..14u64 {
+        pump(&mut rx, &p.on_frame(&quad(198_000 + i * 33_000, [BASE; 4])).unwrap());
+    }
+    assert!(!p.video_mode(), "画面静止后应当退回图块平面");
+    assert_eq!(p.stats.video_off, 1);
+
+    assert!(
+        canvas_equal(&rx.canvas, &back),
+        "退出平面后画布还停在预热期的中途内容上（块 1 应当是 {:08x}）",
+        BASE
+    );
+}

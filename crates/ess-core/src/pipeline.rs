@@ -438,6 +438,26 @@ impl<'c> SendPipeline<'c> {
         }
     }
 
+    /// 退出平面时用于收差集的基线：**交接这一刻**观看端手里的画面，也就是最后一条
+    /// 真正发出去的无损更新（`last_sent`）。
+    ///
+    /// 为什么不能沿用"决定要交"那一刻的快照：**预热期画面仍由无损差分出**（那是预热存在
+    /// 的前提，见 [`Self::plane_handover`]），那几帧的更新照常发出、照常 `commit`，
+    /// 观看端画布因此往前走，快照却停在决策点上。退出时按过期基线收差集，凡是在预热期
+    /// 变过、又变回基线样子的块都被判成"没变"，一个字节都不发——观看端永久停在中途
+    /// 内容上；而两端版本账还是一致的（版本只在真正发出时推进），报告看不出缺口，
+    /// 脱落补账那条路也轮不到它（实测 `missing=0 behind=0`、`REPAIR` 只剩退出那一次）。
+    /// 周期性内容很容易撞上这种巧合：1280x720 合成屏上底部一块停在动画第 5 帧的内容上，
+    /// 终帧 MAE 0.128、逐块只错这一块。
+    ///
+    /// `None` 保持 `None`：那是"基线不可信、退出补整帧"的既有语义（脱落补账、多人画布
+    /// 不同源），不能被这里悄悄复活。
+    fn refresh_exit_baseline(&mut self) {
+        if self.repair_baseline.is_some() {
+            self.repair_baseline = Some(self.state.last_sent.clone());
+        }
+    }
+
     /// 现在就把画面交给媒体平面吗？`false` = 还要预热，画面继续由无损图块出。
     ///
     /// 预热存在的理由：**交接这一帧要付一个关键帧**。1080p 平衡档实测那一次 pacing
@@ -736,6 +756,7 @@ impl<'c> SendPipeline<'c> {
                 self.video_mode = true;
                 out.push(self.video_msg(true));
                 self.stats.video_on += 1;
+                self.refresh_exit_baseline();
             }
             // 预热中（决定要交、但还没交）：这一帧继续走下面的普通无损差分，不发
             // Motion——那是给有损平面兜底的 JPEG，而此刻画布还是无损的。
@@ -992,6 +1013,8 @@ impl<'c> SendPipeline<'c> {
                 self.video_mode = true;
                 self.stats.video_on += 1;
                 out.push(self.video_msg(true));
+                // 预热中途被预算/算力/落后逼成交接时，上面那份基线是决策点的、已经过期。
+                self.refresh_exit_baseline();
             }
             return Ok(out);
         }
