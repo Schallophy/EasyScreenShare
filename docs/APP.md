@@ -613,6 +613,8 @@ ESS_DEMO_ANIM=200 scripts/fanout.sh "1 12"   # 全程动画：画面改由视频
 | 决策日志 | `ESS_DECIDE=1` | 每帧两行：`DECIDE`（运动面积 / 需求 / 链路 / 平面 / 预热）与 `BUDGET`（`changed= demand= budget= room= enc_press= strain= plane=`）。归因出错时 `forced_plane` 只有累计值，看不出**三条理由此刻各自成不成立**——§14.7.4 的 strain 抢账就是靠这行定位的 |
 | 验收脚本 | `scripts/narrow-link.sh` | 窄链路验收（#32）：用 `ESS_EGRESS_CAP` 真的把数据通道限速，再重跑既有门禁（无损脱落必须收敛 / 1080p 移动内容切平面 / 上限低于无损需求时必须交接）。它自己**不新造判据**，并强制自证"东西真的出门了"（`sent>1`）——上一版桶写成睡到还清，一条整帧钉住发送任务，我把仪器 bug 当成产品缺陷立过案（#51，同日翻案） |
 | 环境变量 | `ESS_EGRESS_CAP=N` | 测量台：给整条数据通道加人为上行上限（bps）的令牌桶。可靠消息桶空就地等（=排队），不可靠消息桶空就丢（=丢包），STATS 报 `egress_cap=` / `shed=`。**默认 0 = 关**，生产路径与不限速时逐字节一致（§14.7.6） |
+| 环境变量 | `ESS_STRAIN=0\|force` | 受控实验：`0` 关掉"观看端跟不上"这条理由（`forced-plane` 用它让预算成为唯一可能的成因），`force` 直接注入该信号（`strain-static-exit` 用它验"平面静止后退回"）。**默认不设 = 生产行为**。为什么两条门禁必须分开，见 §14.7.37 |
+| 环境变量 | `ESS_BUDGET=N` | 受控实验：把图块通路预算钉成 N bps（`0` = 不限制），让"链路装不下"这条理由让开。**默认不设 = 按实测链路算**。`strain-static-exit` 用它，因为慢观看端会先把链路压出拥塞、预算会先到 |
 | 环境变量 | `ESS_VIDEO_BITRATE=N` | 手动指定视频轨目标码率（bps），用来跑码率阶梯；不指定 = 按产品档 bpp 自动定档 |
 | 验收脚本 | `scripts/perf-load.sh` / `scripts/slow-client.sh` | 1080p 四组吞吐·新鲜度门禁（17 项）/ 慢观看端两臂对照（5 项，含负对照） |
 | 环境变量 | `ESS_AUDIO_DTX=0`、`ESS_AUDIO_BITRATE=N` | 声音静音抑制 / 音频码率档位，见「系统声音」一节 |

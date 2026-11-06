@@ -220,6 +220,11 @@ pub struct SendPipeline<'c> {
     /// 最近一次观看端报告是否大面积落后 ≥2 版（观看端解码跟不上图块通路）。
     /// 由 `on_report` 自己更新，不需要调用方接线。
     pub receiver_strain: bool,
+    /// 是否允许"观看端跟不上"这条理由去翻平面。默认开；关掉只用于受控实验——
+    /// `forced-plane` 要证明的是"预算压不住"那条契约，而同一段动画在慢机器上会先让
+    /// 观看端真的落后，strain 抢在预算前面翻平面，预算那条契约当帧就记不到账
+    /// （见 §14.7.37）。
+    strain_gate: bool,
     /// 1 s 窗口的起点与已用字节/新变化块数（用帧自带的时间戳，测试里可确定性推进）
     win_ts: u64,
     win_bytes: u64,
@@ -333,6 +338,7 @@ impl<'c> SendPipeline<'c> {
             warm_size: (0, 0),
             warm_max_us: 6_000_000,
             receiver_strain: false,
+            strain_gate: true,
             plane_prev: None,
             loss_claimed: false,
             loss_tiles: Vec::new(),
@@ -377,6 +383,21 @@ impl<'c> SendPipeline<'c> {
     /// 退出的迟滞每帧续期，平面再也回不到无损。所以平面一开就当作废，退出后重新测。
     pub fn set_encode_pressure(&mut self, on: bool) {
         self.encode_pressure = on && !self.video_mode;
+    }
+
+    /// 是否允许"观看端跟不上"这条理由翻平面（默认开）。
+    ///
+    /// 关掉只用于**受控实验**：`forced-plane` 要证明的契约是"预算把图块压住 → 交媒体平面"，
+    /// 而同一段动画在慢机器上会先让观看端真的落后，于是 strain 抢在预算前面翻平面，
+    /// 预算那条契约当帧没机会计数（`forced_plane` 全程 0）。和 `ESS_MOTION=0` 是同一个
+    /// 手法：让被测成因成为唯一可能。见 §14.7.37。
+    pub fn set_strain_gate(&mut self, on: bool) {
+        self.strain_gate = on;
+    }
+
+    /// 能力信号是否参与平面决策（受 `set_strain_gate` 约束）。
+    fn strain_evidence(&self) -> bool {
+        self.strain_gate && self.receiver_strain
     }
 
     /// 传输层真的把无损更新丢掉了（发送队列溢出 `qdrop`、新鲜度闸门 `stale`、限速桶 `shed`）。
@@ -830,7 +851,7 @@ impl<'c> SendPipeline<'c> {
                 // 才留。画面一静止，`fresh_ratio` 掉到门槛以下，迟滞走完就退回无损
                 // （实测：同一场景退出发生在静止后 0.37 s，终帧与期望帧逐字节一致）。
                 if !self.budget_room(demand_now)
-                    || ((self.encode_plane || self.receiver_strain)
+                    || ((self.encode_plane || self.strain_evidence())
                         && fresh_ratio >= self.encode_plane_min_ratio)
                 {
                     self.motion_hold = self.hold_frames;
@@ -978,7 +999,7 @@ impl<'c> SendPipeline<'c> {
         // `loss_forces` 是正确性缺口（补账装不下），不受这条门槛约束。
         let by_budget = (!room && plane_worthy) || loss_forces;
         let by_encode = room && self.encode_pressure && plane_worthy;
-        let by_strain = room && !self.encode_pressure && self.receiver_strain;
+        let by_strain = room && !self.encode_pressure && self.strain_evidence();
         if self.video_plane
             && (!diff.changed.is_empty() || loss_forces)
             && (by_budget || by_encode || by_strain)

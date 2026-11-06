@@ -106,6 +106,22 @@ fn strain_alone_hands_the_picture_to_the_media_plane() {
 }
 
 #[test]
+fn the_strain_gate_can_be_closed_for_controlled_experiments() {
+    // 受控实验用：证明"预算执行器"时，必须让能力信号让开，否则慢机器上的观看端会先
+    // 真的落后，strain 抢在预算前面翻平面，预算那条契约当帧就记不到账（§14.7.37）。
+    // 关掉之后连"落后"本身都不该把画面交出去。
+    let mut p = sender(true);
+    for k in 1..4 {
+        p.on_frame(&mild(k)).unwrap();
+    }
+    p.receiver_strain = true;
+    p.set_strain_gate(false);
+    p.on_frame(&mild(4)).unwrap();
+    assert!(!p.video_mode(), "关掉能力信号后它不该再单独翻平面");
+    assert_eq!(p.stats.strain_forced, 0);
+}
+
+#[test]
 fn budget_keeps_the_attribution_when_strain_is_also_true() {
     // strain 是**跨帧存活**的报告量，可能恰好在"这一帧差分很小、装得下"的时刻先说话。
     // 归因按此刻真正成立的那条判据走：链路装不下就记预算——forced-plane 那条契约证明的是

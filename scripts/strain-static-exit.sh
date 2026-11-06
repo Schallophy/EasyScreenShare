@@ -9,9 +9,18 @@
 #
 # 场景：720p 合成屏（图块编码 < 一帧预算，避免编码压力先把平面举起来）；
 #   ESS_MOTION=0        关掉"大面积运动 → 平面"，平面只能由 strain 逼进；
+#   ESS_BUDGET=0        把图块预算钉在"不限制"，让"链路装不下"这条理由也让开。
+#                       2026-11-06 补：慢观看端会先把链路压出拥塞，预算是**先到**的那个，
+#                       不钉住它，进平面的归因就不是 strain，"静止后退回"测的仍是预算那条路；
+#   ESS_STRAIN=force    直接注入能力信号。原因（2026-11-06）：真做到"啃不动"的观看端，
+#                       修复差集也一定被打预算截断，按判据就**不该**计数——生产里根本
+#                       没有"strain 单独成立"的稳定场景，这个开关让被测机制成为唯一成因。
+#                       本脚本因此测的是"strain 举起的平面在画面静止后退回、且终帧逐字节
+#                       一致"这条机制，而不再是"生产信号真的会冻结"（那一条已由
+#                       §14.7.35 的续期改写消掉，锁它的是 ess-core 的单测）；
 #   前 3 s 静止          观看端要先"跟上"一次，strain 只在 `ever_current` 之后才计数；
 #   3–13 s 动画 / 之后静止；
-#   观看端每块忙等 1500 µs  把应用代价放大到手机量级，才能真的落后 ≥2 版。
+#   观看端每块忙等 1500 µs  把应用代价放大到手机量级。
 #
 # 三条断言：
 #   strain_forced ≥ 1          —— 平面确实是被 strain 逼进来的（不是别的路径）
@@ -53,7 +62,7 @@ grep -qi "address already in use" "$OUT/server.log" && { echo "FAIL 服务端没
 ESS_VIEW_SLOW_US=$SLOW "$BIN/ess-view" --no-window --seconds $((SECS - 4)) \
   --dump "$OUT/received.ppm" >"$OUT/view.log" 2>&1 &
 sleep 1
-ESS_DECIDE=1 ESS_PERF=1 ESS_MOTION=0 \
+ESS_DECIDE=1 ESS_PERF=1 ESS_MOTION=0 ESS_BUDGET=${BUDGET:-0} ESS_STRAIN=${STRAIN:-force} \
   ESS_DEMO_W=$W ESS_DEMO_H=$H ESS_DEMO_ANIM=$ANIM ESS_DEMO_ANIM_DELAY=$DELAY \
   "$BIN/ess-share" --demo --fps "$FPS" --seconds "$SECS" >"$OUT/share.log" 2>&1
 sleep 2

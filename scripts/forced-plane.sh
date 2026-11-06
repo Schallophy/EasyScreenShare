@@ -9,6 +9,12 @@
 # ESS_MOTION=0 关掉「大面积运动 → 视频平面」那套策略判定，于是平面切换**只能**由预算
 # 引起；不加这一条，日志里的 vmode=1 可能只是策略本来就要切，证明不了执行器。
 #
+# ESS_STRAIN=0 同理关掉第三条理由（观看端啃不动图块）。这条是 2026-11-06 补的：
+# 同一段整屏动画在慢机器上会让观看端**真的**落后，于是 strain 抢在预算前面翻平面，
+# 预算那条契约当帧没有机会计数（实测 forced_plane=0 / strain_forced=1，终帧与帧率
+# 都是对的）。门禁要么证明预算，要么证明 strain，不能两个都想要——strain 那条由
+# `strain-static-exit.sh` 单独验。
+#
 # 三条断言：
 #   forced_plane > 0      —— 执行器真的动过（不是只报判定）
 #   fps_cap 全程 30        —— 带宽受限没有拿去动帧率（帧率是对用户的承诺）
@@ -53,7 +59,7 @@ fi
   >"$OUT/view.log" 2>&1 &
 VIEW=$!
 sleep 1
-ESS_PERF=1 ESS_MOTION=0 ESS_DEMO_ANIM=$ANIM \
+ESS_PERF=1 ESS_MOTION=0 ESS_STRAIN=0 ESS_DEMO_ANIM=$ANIM \
   "$BIN/ess-share" --demo --fps "$FPS" --video-bitrate 300000 --seconds "$SECS" \
   >"$OUT/share.log" 2>&1 &
 SHARE=$!

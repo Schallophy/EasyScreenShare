@@ -1270,6 +1270,12 @@ pub async fn run(
                     if let Ok(v) = std::env::var("ESS_MOTION_HOLD") {
                         if let Ok(n) = v.parse() { p.hold_frames = n; }
                     }
+                    // 观看端能力信号（strain）开关，默认开。关掉只用于受控实验：
+                    // `forced-plane` 证明的是"预算压不住"那条契约，慢机器上观看端会先真的
+                    // 落后，strain 抢在预算前面翻平面，那条契约当帧就记不到账。
+                    if let Ok(v) = std::env::var("ESS_STRAIN") {
+                        p.set_strain_gate(v != "0");
+                    }
                     // 算力路径切平面的最低变化占比（0 = 关掉门槛，回到只看能不能编动）
                     if let Ok(v) = std::env::var("ESS_ENCODE_PLANE_MIN_RATIO") {
                         if let Ok(n) = v.parse() { p.encode_plane_min_ratio = n; }
@@ -1674,7 +1680,18 @@ pub async fn run(
                     }
                 }
                 if let Some(p) = pipeline.as_mut() {
-                    p.set_budget_bps(tile_budget);
+                    // 受控实验：`ESS_BUDGET=0` 把图块预算钉在"不限制"，让"预算装不下"这条
+                    // 理由彻底让开。`strain-static-exit.sh` 用它证明 strain **单独**也能把
+                    // 画面举起平面——否则慢观看端会先把链路压出拥塞，预算是先到的那个。
+                    let pinned = std::env::var("ESS_BUDGET").ok().and_then(|v| v.parse::<u64>().ok());
+                    p.set_budget_bps(pinned.unwrap_or(tile_budget));
+                    // `ESS_STRAIN=force` 是把能力信号**按真**注入（同族开关见
+                    // `set_strain_gate`）：慢到啃不动、又慢到修不起来的那类观看端在生产里
+                    // 判不出来（修复预算会把差集截断，按判据就不该计数），所以"strain
+                    // 举起的平面在画面静止后退回"只能靠注入来验。
+                    if std::env::var("ESS_STRAIN").ok().as_deref() == Some("force") {
+                        p.receiver_strain = true;
+                    }
                     p.set_encode_pressure(enc_pressure);
                     // 运动判定要的是**原始链路估计**，不是图块预算：预算已经把视频轨
                     // 的目标码率扣掉了，而换平面的目的正是把画面交给视频轨。
