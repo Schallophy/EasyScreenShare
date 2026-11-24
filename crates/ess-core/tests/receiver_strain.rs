@@ -326,6 +326,9 @@ fn sender_strain_needs_both_breadth_and_depth() {
     for i in 0..small.version.len() {
         small.version[i] = 5;
     }
+    // ever_current 要求"确实描述过画布"（tiles_sent > 0），补上这个前置条件
+    s.stats.tiles_sent = 1;
+    small.stats.tiles_sent = 1;
     let (ls, lsm) = (s.layout_id, small.layout_id);
     let (z64, z4) = (vec![0u32; 64], vec![0u32; 4]);
     // 建立"见过跟上"的基线（能力判据的比较起点，见 `Sender::ever_current`）
