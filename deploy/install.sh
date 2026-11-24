@@ -100,23 +100,26 @@ EOF
 systemctl daemon-reload
 systemctl enable easyscreenshare
 
-# 4. 防火墙
-echo "[4/5] 配置防火墙 ..."
-if command -v ufw >/dev/null; then
+# 4. 防火墙（可选）
+echo "[4/5] 防火墙 ..."
+if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow 7880/tcp >/dev/null 2>&1 || true
     ufw allow 7881/tcp >/dev/null 2>&1 || true
     ufw allow 7882/udp >/dev/null 2>&1 || true
     ufw allow 50000:60000/udp >/dev/null 2>&1 || true
     ufw allow 8088/tcp >/dev/null 2>&1 || true
-elif command -v firewall-cmd >/dev/null; then
+    echo "    已开放端口 (ufw active)"
+elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q "running"; then
     firewall-cmd --permanent --add-port=7880/tcp >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-port=7881/tcp >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-port=7882/udp >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-port=50000-60000/udp >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-port=8088/tcp >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
+    echo "    已开放端口 (firewalld running)"
+else
+    echo "    未检测到活跃防火墙，跳过（端口需自行确保可达）"
 fi
-echo "    已开放 7880/7881/7882/8088 + RTC 50000-60000/udp"
 
 # 5. 启动
 echo "[5/5] 启动服务 ..."
