@@ -1,36 +1,56 @@
 # EasyScreenShare 服务端部署（Debian）
 
-一个二进制 `ess-server`，起来后同时提供 LiveKit、浏览器观看页、Token 接口。
-
-## 部署
-
-从 [Releases](https://github.com/Schallophy/EasyScreenShare/releases) 下载最新包：
+## 一条命令安装
 
 ```bash
-wget https://github.com/Schallophy/EasyScreenShare/releases/latest/download/ess-server-linux-x86_64.tar.gz
-tar -xzf ess-server-linux-x86_64.tar.gz
-cd ess-server-linux-x86_64
-
-# 一键部署（自动生成 Key/Secret）
-sudo bash install.sh
-
-# 或固定密钥（生产环境推荐）
-sudo bash install.sh --key mykey --secret mysecret-at-least-32-chars
+curl -fsSL https://raw.githubusercontent.com/Schallophy/EasyScreenShare/main/deploy/easy-install.sh | sudo bash
 ```
 
-脚本会：装 livekit-server、装 ess-server + web 观看页、注册 systemd 服务、开防火墙、启动。
+脚本会下载最新 release，然后 `ess-server install` 自动完成：
 
-装完看连接信息：
+1. 把 `ess-server` 注册为系统命令（`/usr/local/bin/ess-server`）
+2. 安装浏览器观看页（`/usr/local/share/easyscreenshare/web`）
+3. 下载 `livekit-server`（已有则跳过）
+4. 生成 systemd 服务并启动（密钥写死，重启不变）
+
+固定密钥：
 
 ```bash
-journalctl -u easyscreenshare -n 30 --no-pager
+curl -fsSL https://raw.githubusercontent.com/Schallophy/EasyScreenShare/main/deploy/easy-install.sh | sudo bash -s -- --key mykey --secret mysecret32chars
 ```
 
-输出里会打印观看页地址、API Key/Secret、分享端命令。
+## 一条命令卸载
+
+```bash
+sudo ess-server uninstall          # 停服务、删命令与观看页
+sudo ess-server uninstall --purge  # 连 livekit-server 一起删
+```
+
+没装过命令的话：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Schallophy/EasyScreenShare/main/deploy/easy-install.sh | sudo bash -s -- --uninstall
+```
+
+## 状态与日志
+
+```bash
+ess-server status                  # 服务状态 + 最近 20 行日志
+systemctl restart easyscreenshare
+journalctl -u easyscreenshare -f
+```
+
+## 手动跑（不装 systemd）
+
+```bash
+./ess-server                       # 前台，Ctrl+C 停止
+./ess-server --key k --secret s
+./ess-server --help
+```
 
 ## 客户端
 
-**观看端**：浏览器打开 `http://<服务器IP>:8088/`
+**观看端**：浏览器打开 `http://<服务器IP>:8088/`（免安装）。
 
 **分享端**（Windows 桌面）：
 
@@ -41,31 +61,7 @@ ess-share --url ws://<服务器IP>:7880 \
           --secret <打印的Secret>
 ```
 
-分享端 UI 也能用，在「高级：密钥」里填同一组 Key/Secret。
-
-## ess-server 单独用（不装 systemd）
-
-```bash
-./ess-server                 # Ctrl+C 停止
-./ess-server --key k --secret s
-./ess-server --lk-port 7880 --port 8088 --room myroom
-```
-
-## 生产环境清单
-
-- [ ] 用 `--key` / `--secret` 固定密钥
-- [ ] 套 Nginx + TLS（`https`/`wss`），否则浏览器拦混合内容
-- [ ] 服务器上行带宽够（视频流 2–10 Mbps/路）
-- [ ] 客户端在 NAT 后时配 TURN
-
-## 管理
-
-```bash
-systemctl status easyscreenshare    # 状态
-journalctl -u easyscreenshare -f    # 实时日志
-systemctl restart easyscreenshare   # 重启
-sudo bash uninstall.sh              # 卸载
-```
+或分享端 UI 的「高级：密钥」里填同一组。
 
 ## 端口
 
@@ -76,3 +72,10 @@ sudo bash uninstall.sh              # 卸载
 | 7882 | UDP | LiveKit RTC |
 | 50000-60000 | UDP | RTC 媒体 (ICE) |
 | 8088 | TCP | 浏览器观看页 |
+
+## 生产环境清单
+
+- [ ] 固定密钥（`--key/--secret`，否则每次重启都会变）
+- [ ] 套 Nginx + TLS（`https`/`wss`），否则浏览器拦混合内容
+- [ ] 服务器上行带宽够（视频流 2–10 Mbps/路）
+- [ ] 客户端在 NAT 后时配 TURN

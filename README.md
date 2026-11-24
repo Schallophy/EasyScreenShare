@@ -6,17 +6,15 @@
 
 ## 一键部署服务端（Debian）
 
-```bash
-# 下载（CI 构建的预编译包，服务器上不需要 Rust 工具链）
-wget https://github.com/Schallophy/EasyScreenShare/releases/latest/download/ess-server-linux-x86_64.tar.gz
-tar -xzf ess-server-linux-x86_64.tar.gz
-cd ess-server-linux-x86_64
+服务器上一条命令：
 
-# 部署
-sudo bash install.sh
+```bash
+curl -fsSL https://raw.githubusercontent.com/Schallophy/EasyScreenShare/main/deploy/easy-install.sh | sudo bash
 ```
 
-服务启动后会打印观看页地址、API Key/Secret、分享端命令。浏览器打开观看页即可。
+自动完成：注册 `ess-server` 命令 → 安装观看页 → 下载 LiveKit → 建 systemd 服务并启动，并打印观看页地址、API Key/Secret、分享端命令。
+
+卸载：`sudo ess-server uninstall`（连 LiveKit 一起删加 `--purge`）。
 
 从源码构建只要一条命令（不编译 WebRTC，一两分钟）：
 

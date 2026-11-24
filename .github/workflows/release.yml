@@ -51,8 +51,8 @@ jobs:
           cp crates/ess-web/web/app.js dist/ess-server-linux-x86_64/web/
           cp crates/ess-web/web/ess_web.wasm dist/ess-server-linux-x86_64/web/
           cp crates/ess-web/web/livekit-client.umd.js dist/ess-server-linux-x86_64/web/
-          # 部署脚本
-          cp deploy/install.sh deploy/uninstall.sh deploy/README.md dist/ess-server-linux-x86_64/
+          # 部署脚本（install/uninstall 是薄壳，逻辑都在 ess-server 自身）
+          cp deploy/install.sh deploy/uninstall.sh deploy/README.md deploy/easy-install.sh dist/ess-server-linux-x86_64/
           tar -czvf ess-server-linux-x86_64.tar.gz -C dist ess-server-linux-x86_64
           echo "=== 包内容 ==="
           tar -tzvf ess-server-linux-x86_64.tar.gz
