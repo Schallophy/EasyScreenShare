@@ -15,6 +15,14 @@ tokio-stream = "0.1"
 minifb = "0.27"
 livekit = "0.9"
 
+# ess-server 依赖：枚举网卡地址 + Ctrl+C 信号
+local-ip-address = { version = "0.6", optional = true }
+signal-hook = { version = "0.3", optional = true }
+
+[features]
+default = []
+server = ["local-ip-address", "signal-hook"]
+
 # 局域网地址选择要枚举网卡（IfType / _operStatus / 网关），不为此引第三方封装
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -46,3 +54,8 @@ path = "src/bin/tone.rs"
 [[bin]]
 name = "ess-scroll-dump"
 path = "src/bin/scroll_dump.rs"
+
+[[bin]]
+name = "ess-server"
+path = "src/bin/server.rs"
+required-features = ["server"]

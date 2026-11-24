@@ -4,6 +4,23 @@
 （`ess-share`）+ 观看端（`ess-view` 原生窗口，或**纯浏览器、免安装**）。
 传输走 LiveKit 数据通道，图块平面逐像素无损。
 
+## 一键部署服务端（Debian）
+
+```bash
+# 下载
+wget https://github.com/你的用户名/EasyScreenShare/releases/latest/download/ess-server-linux-x86_64.tar.gz
+tar -xzf ess-server-linux-x86_64.tar.gz
+
+# 部署
+sudo bash install.sh
+```
+
+服务启动后会打印观看页地址、API Key/Secret、分享端命令。浏览器打开观看页即可。
+
+详细说明见 [deploy/README.md](deploy/README.md)。
+
+---
+
 内部前缀一律 `ess`：crate 名、线格式 `package ess`（`crates/ess-core/proto/ess.proto`）、
 `ESS_*` 环境变量、LiveKit 轨名 `ess-screen` / `ess-audio`。
 

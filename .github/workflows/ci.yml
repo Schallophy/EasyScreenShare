@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check
+        run: cargo check -p ess-core -p ess-transport -p ess-codec-palette -p ess-codec-png
+
+      - name: Test
+        run: cargo test -p ess-core -p ess-transport -p ess-codec-palette -p ess-codec-png
+
+  build-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-server-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build web
+        run: scripts/build-web.sh
+        env:
+          CI: true
+
+      - name: Build ess-server
+        run: cargo build --release -p ess-app --features server --bin ess-server
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ess-server
+          path: target/release/ess-server
+          retention-days: 7

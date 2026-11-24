@@ -1,0 +1,22 @@
+[Unit]
+Description=EasyScreenShare 服务端
+After=network.target
+
+[Service]
+Type=simple
+# 环境变量指向 ess-server 和 livekit-server 所在目录
+# ess-server 会自动在同目录/系统路径找 livekit-server
+ExecStart=/usr/local/bin/ess-server
+# 或者显式传密钥（生产环境推荐）
+# ExecStart=/usr/local/bin/ess-server --key abc123 --secret xyz789...
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# 防止 fork 出来的 LiveKit 子进程被误杀
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
