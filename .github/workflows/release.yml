@@ -1,10 +1,13 @@
-name: Build and Release
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:  # 手动触发（仅构建测试，不发 Release）
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -16,7 +19,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          # wasm32 给 build-web.sh 用，linux-glibc 是宿主目标
+          targets: x86_64-unknown-linux-gnu,wasm32-unknown-unknown
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -30,35 +34,38 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build web assets
-        run: scripts/build-web.sh
-        env:
-          CI: true
+        # 生成 ess_web.wasm + livekit-client.umd.js（都不入库，由脚本取回/编译）
+        run: bash scripts/build-web.sh
 
       - name: Build ess-server
         run: cargo build --release -p ess-app --features server --bin ess-server
 
       - name: Package
         run: |
-          mkdir -p dist
-          cp target/release/ess-server dist/
-          cp -r target/wasm32-unknown-unknown/release/ess_web.wasm dist/ 2>/dev/null || true
-          cp crates/ess-web/web/index.html dist/ 2>/dev/null || true
-          cp crates/ess-web/web/app.js dist/ 2>/dev/null || true
-          cp -r deploy/* dist/
-          cd dist && tar -czvf ess-server-linux-x86_64.tar.gz ess-server install.sh uninstall.sh easyscreenshare.service README.md
+          set -e
+          mkdir -p dist/ess-server-linux-x86_64/web
+          cp target/release/ess-server dist/ess-server-linux-x86_64/
+          # ess-server 在程序目录下的 web/ 找观看页
+          cp crates/ess-web/web/index.html dist/ess-server-linux-x86_64/web/
+          cp crates/ess-web/web/app.js dist/ess-server-linux-x86_64/web/
+          cp crates/ess-web/web/ess_web.wasm dist/ess-server-linux-x86_64/web/
+          cp crates/ess-web/web/livekit-client.umd.js dist/ess-server-linux-x86_64/web/
+          # 部署脚本（不含 install.sh 里对 ./ess-server 的依赖，走 systemd 路径）
+          cp deploy/install.sh deploy/uninstall.sh deploy/README.md dist/ess-server-linux-x86_64/
+          tar -czvf ess-server-linux-x86_64.tar.gz -C dist ess-server-linux-x86_64
+          echo "=== 包内容 ==="
+          tar -tzvf ess-server-linux-x86_64.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ess-server-linux-x86_64
-          path: dist/ess-server-linux-x86_64.tar.gz
+          path: ess-server-linux-x86_64.tar.gz
 
   release:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -70,23 +77,3 @@ jobs:
         with:
           files: ess-server-linux-x86_64.tar.gz
           generate_release_notes: true
-          body: |
-            ## EasyScreenShare 服务端
-
-            ### 安装
-            ```bash
-            # 下载
-            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ess-server-linux-x86_64.tar.gz
-            tar -xzf ess-server-linux-x86_64.tar.gz
-
-            # 一键部署
-            sudo bash install.sh
-            ```
-
-            ### 使用
-            服务启动后会打印：
-            - 观看页地址
-            - API Key / Secret
-            - 分享端命令
-
-            观看端浏览器打开即可，分享端填入打印的参数。
