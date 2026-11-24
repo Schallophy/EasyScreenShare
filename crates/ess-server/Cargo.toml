@@ -1,0 +1,13 @@
+[package]
+name = "ess-server"
+version = "0.1.0"
+edition = "2021"
+description = "EasyScreenShare 一体化服务端：LiveKit + 浏览器观看页"
+
+[dependencies]
+# 观看页实现（只依赖 tokio + livekit-token，无 WebRTC）
+ess-viewer = { path = "../ess-viewer" }
+# 枚举网卡地址（纯 Rust，Linux 走 netlink）
+local-ip-address = "0.6"
+# Ctrl+C 优雅退出
+signal-hook = "0.3"

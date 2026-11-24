@@ -1153,10 +1153,9 @@ dependencies = [
  "ess-core",
  "ess-session",
  "ess-transport",
+ "ess-viewer",
  "livekit",
- "local-ip-address",
  "minifb",
- "signal-hook",
  "tokio",
  "tokio-stream",
  "windows-sys 0.59.0",
@@ -1221,6 +1220,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ess-server"
+version = "0.1.0"
+dependencies = [
+ "ess-viewer",
+ "local-ip-address",
+ "signal-hook",
+]
+
+[[package]]
 name = "ess-session"
 version = "0.1.0"
 dependencies = [
@@ -1255,6 +1263,14 @@ dependencies = [
  "livekit",
  "livekit-token",
  "prost 0.13.5",
+ "tokio",
+]
+
+[[package]]
+name = "ess-viewer"
+version = "0.1.0"
+dependencies = [
+ "livekit-token",
  "tokio",
 ]
 

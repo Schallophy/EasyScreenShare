@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ess-core", "crates/ess-bench", "crates/lk-probe", "crates/ess-codec-palette", "crates/ess-codec-png", "crates/ess-transport", "crates/ess-capture", "crates/ess-audio", "crates/ess-app", "crates/ess-web", "crates/ess-session", "crates/ess-share-ui"]
+members = ["crates/ess-core", "crates/ess-bench", "crates/lk-probe", "crates/ess-codec-palette", "crates/ess-codec-png", "crates/ess-transport", "crates/ess-capture", "crates/ess-audio", "crates/ess-app", "crates/ess-web", "crates/ess-session", "crates/ess-share-ui", "crates/ess-viewer", "crates/ess-server"]
 
 [profile.release]
 opt-level = 3

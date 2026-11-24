@@ -2,7 +2,9 @@
 //!
 //! 观看方只需打开 `http://<host>:<port>/`，无需安装客户端，也不用填房间——
 //! 房间号是这里给的（`app.js` 只 `fetch('token')`）。
-//! 依赖只有 tokio：HTTP/1.1 的静态服务不值得引入完整框架。
+//!
+//! 这个 crate 只依赖 tokio + livekit-token（纯 Rust 签 JWT），
+//! **不引 livekit/webrtc-sys**，所以编译和部署都不需要 X11/glib。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,7 +132,22 @@ async fn handle(mut s: TcpStream, inner: Arc<Inner>) {
         };
         let id = inner.next.fetch_add(1, Ordering::Relaxed) + 1;
         let identity = format!("web-{id}");
-        let tok = ess_transport::token(&inner.key, &inner.secret, &room, &identity);
+        let tok = {
+            use livekit_token::{AccessToken, VideoGrants};
+            AccessToken::with_api_key(&inner.key, &inner.secret)
+                .with_identity(&identity)
+                .with_name(&identity)
+                .with_grants(VideoGrants {
+                    room_join: true,
+                    room: room.clone(),
+                    can_publish: Some(false), // 观看方只订阅
+                    can_publish_data: Some(true), // 要发状态报告
+                    can_subscribe: Some(true),
+                    ..Default::default()
+                })
+                .to_jwt()
+                .unwrap_or_default()
+        };
         let body = format!(
             "{{\"url\":\"{url}\",\"room\":\"{room}\",\"identity\":\"{identity}\",\"token\":\"{tok}\"}}"
         );

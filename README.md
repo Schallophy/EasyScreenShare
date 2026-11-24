@@ -7,12 +7,21 @@
 ## 一键部署服务端（Debian）
 
 ```bash
-# 下载
-wget https://github.com/你的用户名/EasyScreenShare/releases/latest/download/ess-server-linux-x86_64.tar.gz
+# 下载（CI 构建的预编译包，服务器上不需要 Rust 工具链）
+wget https://github.com/Schallophy/EasyScreenShare/releases/latest/download/ess-server-linux-x86_64.tar.gz
 tar -xzf ess-server-linux-x86_64.tar.gz
+cd ess-server-linux-x86_64
 
 # 部署
 sudo bash install.sh
+```
+
+服务启动后会打印观看页地址、API Key/Secret、分享端命令。浏览器打开观看页即可。
+
+从源码构建只要一条命令（不编译 WebRTC，一两分钟）：
+
+```bash
+cargo build --release -p ess-server
 ```
 
 服务启动后会打印观看页地址、API Key/Secret、分享端命令。浏览器打开观看页即可。
@@ -37,6 +46,8 @@ sudo bash install.sh
 | `ess-transport` | LiveKit 连接、令牌、消息拆批（lossy）、整帧分片/重组（reliable） |
 | `ess-capture` | Windows GDI 采集 + 合成屏（验收用） |
 | `ess-app` | `ess-share` / `ess-view` / `ess-serve` / `ess-gen-expected` 可执行程序 |
+| `ess-viewer` | 观看页服务 + LiveKit 令牌（只依赖 tokio + livekit-token，**不碰 webrtc-sys**） |
+| `ess-server` | 一体化服务端：拉起 LiveKit + 托管观看页；一条命令部署，编译不依赖 X11/glib |
 | `ess-session` | 共享会话库（采集→管线→LiveKit），CLI 与图形外壳共用 |
 | `ess-share-ui` | 分享端图形外壳（Tauri v2，开始/停止、参数、实时统计、日志） |
 | `ess-web` | 浏览器观看端 WASM：接收管线（判定/滚动原子应用/分片重组）裸 C ABI |

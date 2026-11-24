@@ -1,0 +1,10 @@
+[package]
+name = "ess-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "浏览器观看页：静态文件 + LiveKit 令牌（无 WebRTC 依赖）"
+
+[dependencies]
+# 只依赖纯 Rust 的令牌签发；不引 livekit（webrtc-sys）
+livekit-token = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
