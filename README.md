@@ -24,8 +24,6 @@ sudo bash install.sh
 cargo build --release -p ess-server
 ```
 
-服务启动后会打印观看页地址、API Key/Secret、分享端命令。浏览器打开观看页即可。
-
 详细说明见 [deploy/README.md](deploy/README.md)。
 
 ---
